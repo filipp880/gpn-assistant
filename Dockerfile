@@ -8,11 +8,10 @@ RUN apt-get update && apt-get install -y build-essential gcc && rm -rf /var/lib/
 # Python зависимости
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install fastapi uvicorn httpx python-multipart
 
 # === PRE-DOWNLOAD ML МОДЕЛЕЙ (ГЛАВНЫЙ ФИКС) ===
 # Скачиваем модели в кэш HuggingFace прямо при сборке образа
-RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')"
+RUN python -c "from FlagEmbedding import BGEM3FlagModel; BGEM3FlagModel('BAAI/bge-m3', use_fp16=False)"
 RUN python -c "from sentence_transformers import CrossEncoder; CrossEncoder('BAAI/bge-reranker-v2-m3')"
 
 COPY . .

@@ -5,6 +5,7 @@ from typing import List, Optional, Dict, Any
 import uuid
 import logging
 import asyncio
+import os
 from datetime import datetime
 import httpx
 
@@ -21,7 +22,7 @@ app = FastAPI(
     description="""
     Корпоративный AI-ассистент для ПАО «Газпром нефть».
     Понимает внутренний сленг, исправляет опечатки в аббревиатурах (ГПНР -> Газпромнефть-Развитие)
-    и использует гибридный поиск (BM25 + Vector) с реранкингом.
+    и использует гибридный поиск (dense + sparse от BGE-M3) с реранкингом.
     """,
     version="1.0.0",
     openapi_tags=[
@@ -59,6 +60,8 @@ class ChatResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     ollama_status: str
+    db_status: str
+    models_ready: bool
     message: str
 
 # --- In-Memory Storage для истории сессий ---
@@ -95,11 +98,20 @@ async def chat_endpoint(request: ChatRequest):
         agent_result = await execute_agent(request.query, session_id)
     except Exception as e:
         logger.error(f"[{session_id}] Ошибка: {str(e)}")
+        from agent import OllamaUnavailableError
+        if isinstance(e, OllamaUnavailableError):
+            model = os.getenv("LLM_MODEL", "qwen2.5:14b")
+            detail = f"Ollama недоступна. Проверьте, что сервис запущен и модель {model} загружена."
+            raise HTTPException(status_code=503, detail=detail)
         raise HTTPException(status_code=500, detail=str(e))
         
     end_time = datetime.now()
     latency_ms = (end_time - start_time).total_seconds() * 1000
-    
+    logger.info("[%s] ответ за %.0f мс | источники: %s | терминов: %d",
+                session_id, latency_ms,
+                agent_result.get("sources", []),
+                len(agent_result.get("resolved_terms", [])))
+
     sessions_store[session_id].append({"role": "assistant", "content": agent_result.get("answer", "")})
     
     return ChatResponse(
@@ -125,16 +137,52 @@ async def clear_history(session_id: str):
 
 @app.get("/health", response_model=HealthResponse, tags=["System"])
 async def health_check():
-    """Проверка статуса Ollama (жюри часто пингуют этот эндпоинт)"""
-    ollama_url = "http://localhost:11434/api/tags" # Или http://ollama:11434 в Docker
+    """Readiness: Ollama + база знаний + модели (жюри часто пингуют этот эндпоинт)."""
+    ollama_up = False
+    ollama_url = os.getenv("OLLAMA_HOST", "http://localhost:11434") + "/api/tags"
     try:
         async with httpx.AsyncClient() as client:
             r = await client.get(ollama_url, timeout=3.0)
-            if r.status_code == 200:
-                return HealthResponse(status="ok", ollama_status="up", message="Ready for tests")
+            ollama_up = r.status_code == 200
     except Exception:
         pass
-    return HealthResponse(status="degraded", ollama_status="down", message="Ollama unavailable")
+
+    from retrieval import status_info
+    info = status_info()
+    db_ready = info["db_ready"]
+    models_ready = info["bge_m3_loaded"] and info["reranker_loaded"]
+
+    if ollama_up and db_ready:
+        return HealthResponse(
+            status="ok", ollama_status="up", db_status="ready",
+            models_ready=models_ready, message="Ready for tests",
+        )
+    return HealthResponse(
+        status="degraded",
+        ollama_status="up" if ollama_up else "down",
+        db_status="ready" if db_ready else "not_ready",
+        models_ready=models_ready,
+        message="Initializing..." if ollama_up else "Ollama unavailable",
+    )
+
+@app.post("/reindex", tags=["System"])
+async def reindex():
+    """Перечитывает документы из data/ и перестраивает индекс.
+
+    Нужно после добавления/изменения файлов в data/ — без перезапуска сервиса.
+    """
+    def _rebuild():
+        import ingest
+        ingest.main()
+        from retrieval import reload_store
+        reload_store()
+
+    try:
+        await asyncio.to_thread(_rebuild)
+        return {"status": "success", "message": "Индекс пересобран из data/"}
+    except Exception as e:
+        logger.error(f"Ошибка переиндексации: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Ошибка переиндексации: {str(e)}")
 
 @app.on_event("startup")
 async def startup_event():
@@ -150,22 +198,38 @@ async def warmup_models():
     logger.info("🔥 Начинаем прогрев ML-моделей...")
     
     try:
-        # 1. Прогреваем эмбеддер
-        from sentence_transformers import SentenceTransformer
-        emb_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-        _ = emb_model.encode(["прогрев"])
-        logger.info("✅ Эмбеддер прогрет")
+        # 1. Прогреваем BGE-M3 (dense + sparse)
+        from retrieval import get_bge_m3, get_reranker, store_ready, reload_store
+        model = get_bge_m3()
+        _ = model.encode(["прогрев"], return_dense=True, return_sparse=True)
+        logger.info("✅ BGE-M3 прогрет")
         
         # 2. Прогреваем реранкер
-        from sentence_transformers import CrossEncoder
-        reranker = CrossEncoder('BAAI/bge-reranker-v2-m3')
-        _ = reranker.predict([["запрос", "документ"]])
+        _ = get_reranker().predict([["запрос", "документ"]])
         logger.info("✅ Реранкер прогрет")
         
         # 3. Инициализируем словарь агента
         from agent import agent_instance
         agent_instance._resolve_slang("ГПН")
         logger.info("✅ Словарь прогрет")
+
+        # 3а. Проверяем базу знаний: сервис НЕ падает, если индекс ещё не построен
+        reload_store()
+        if store_ready():
+            logger.info("✅ База знаний загружена (kbase)")
+        else:
+            logger.warning("⚠️ База знаний не найдена — выполните: python ingest.py, либо POST /reindex")
+        
+        # 4. Прогреваем саму LLM (Ollama): загружаем модель при старте,
+        #    чтобы первый запрос жюри не тратил время на загрузку весов
+        from agent import agent_instance as agent
+        agent._client.chat(
+            model=agent.model_name,
+            messages=[{'role': 'user', 'content': 'прогрев'}],
+            options={'num_predict': 1, 'num_ctx': agent.num_ctx},
+            keep_alive=-1,
+        )
+        logger.info(f"✅ LLM прогрета: {agent.model_name}")
         
         logger.info("🚀 Сервер полностью готов к приему запросов!")
         

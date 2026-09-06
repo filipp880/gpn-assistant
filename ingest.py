@@ -1,16 +1,16 @@
+import logging
 import os
 import chromadb
+from core import adaptive_chunk
+from retrieval import get_bge_m3, auto_tune_if_data_changed
 
-def chunk_with_overlap(text: str, chunk_size: int = 500, overlap: int = 150) -> list[str]:
-    step = chunk_size - overlap
-    chunks = []
-    for i in range(0, len(text), step):
-        chunk = text[i : i + chunk_size].strip()
-        if chunk:
-            chunks.append(chunk)
-    return chunks
+logger = logging.getLogger(__name__)
 
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
     if hasattr(chromadb, "PersistentClient"):
         client = chromadb.PersistentClient(path="./chromadb")
     elif hasattr(chromadb, "Client"):
@@ -22,34 +22,45 @@ def main():
         client.delete_collection('kbase')
     except Exception:
         pass
-        
+
     collection = client.create_collection(
-        name='kbase', 
+        name='kbase',
         metadata={"hnsw:space": "cosine"}
     )
 
     data_dir = 'data'
+    if not os.path.isdir(data_dir):
+        logger.warning("Не найдена директория data/ — база знаний не построена.")
+        return
+
+    model = get_bge_m3()
+
     for fname in os.listdir(data_dir):
         fpath = os.path.join(data_dir, fname)
         if os.path.isfile(fpath) and fname.endswith('.txt'):
             with open(fpath, 'r', encoding='utf-8') as f:
                 text = f.read()
-                
-            chunks = chunk_with_overlap(text)
-            
+
+            chunks = adaptive_chunk(text)
+
             if not chunks:
                 continue
 
+            dense = model.encode(chunks, return_dense=True, return_sparse=False)["dense_vecs"]
+
             collection.add(
                 documents=chunks,
+                embeddings=dense.tolist(),
                 ids=[f"{fname}_{i}" for i in range(len(chunks))],
                 metadatas=[{'source': fname} for _ in chunks]
             )
-            print(f"{fname}: {len(chunks)} чанков")
+            logger.info("%s: %d чанков", fname, len(chunks))
 
-    print("\n--- Проверка фильтрации ---")
-    res = collection.get(where={'source': 'transformer_notes.txt'})
-    print("чанков из transformer_notes.txt:", len(res['ids']))
+    logger.info("Проверка фильтрации: %d чанков из transformer_notes.txt",
+                len(collection.get(where={'source': 'transformer_notes.txt'})['ids']))
+
+    logger.info("Авто-подбор параметров retrieval...")
+    auto_tune_if_data_changed()
 
 if __name__ == "__main__":
     main()
