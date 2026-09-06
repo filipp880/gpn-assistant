@@ -1,0 +1,27 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    entrypoint: ["/bin/sh", "-c", "ollama serve & sleep 10 && ollama pull llama3.2 && wait"]
+
+  gpn_assistant:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data          
+      - ./chroma_db:/app/chroma_db 
+      - hf_cache:/root/.cache/huggingface
+    depends_on:
+      - ollama
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - TRANSFORMERS_OFFLINE=0
+      - HF_HUB_DISABLE_TELEMETRY=1
+
+volumes:
+  ollama_data:
+  hf_cache:

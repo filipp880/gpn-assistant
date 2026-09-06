@@ -3,3 +3,4 @@ sentence-transformers
 rank_bm25
 ollama
 pymorphy3
+rapidfuzz==3.9.0
