@@ -1,0 +1,369 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "GPN Corporate AI Assistant API",
+    "description": "\n    Корпоративный AI-ассистент для ПАО «Газпром нефть».\n    Понимает внутренний сленг, исправляет опечатки в аббревиатурах (ГПНР -> Газпромнефть-Развитие)\n    и использует гибридный поиск (dense + sparse от BGE-M3) с реранкингом.\n    ",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/chat": {
+      "post": {
+        "tags": [
+          "Core"
+        ],
+        "summary": "Chat Endpoint",
+        "operationId": "chat_endpoint_chat_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/history/{session_id}": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "summary": "Get History",
+        "operationId": "get_history_history__session_id__get",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Session Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "System"
+        ],
+        "summary": "Clear History",
+        "operationId": "clear_history_history__session_id__delete",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Session Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "summary": "Health Check",
+        "description": "Readiness: Ollama + база знаний + модели (жюри часто пингуют этот эндпоинт).",
+        "operationId": "health_check_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/reindex": {
+      "post": {
+        "tags": [
+          "System"
+        ],
+        "summary": "Reindex",
+        "description": "Перечитывает документы из data/ и перестраивает индекс.\n\nНужно после добавления/изменения файлов в data/ — без перезапуска сервиса.",
+        "operationId": "reindex_reindex_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ChatRequest": {
+        "properties": {
+          "query": {
+            "type": "string",
+            "title": "Query",
+            "description": "Запрос пользователя",
+            "example": "Какая EBITDA у ГПНР за 2025 год?"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id",
+            "description": "ID сессии для мульти-тернового диалога"
+          }
+        },
+        "type": "object",
+        "required": [
+          "query"
+        ],
+        "title": "ChatRequest"
+      },
+      "ChatResponse": {
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "answer": {
+            "type": "string",
+            "title": "Answer"
+          },
+          "sources": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Sources",
+            "description": "Источники из ChromaDB"
+          },
+          "resolved_terms": {
+            "items": {
+              "$ref": "#/components/schemas/ResolvedTerm"
+            },
+            "type": "array",
+            "title": "Resolved Terms",
+            "description": "Лог распознавания аббревиатур"
+          },
+          "raw_context": {
+            "type": "string",
+            "title": "Raw Context",
+            "description": "Сырой контекст, ушедший в промт LLM",
+            "default": ""
+          },
+          "latency_ms": {
+            "type": "number",
+            "title": "Latency Ms"
+          }
+        },
+        "type": "object",
+        "required": [
+          "session_id",
+          "answer",
+          "latency_ms"
+        ],
+        "title": "ChatResponse"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "HealthResponse": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "ollama_status": {
+            "type": "string",
+            "title": "Ollama Status"
+          },
+          "db_status": {
+            "type": "string",
+            "title": "Db Status"
+          },
+          "models_ready": {
+            "type": "boolean",
+            "title": "Models Ready"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "ollama_status",
+          "db_status",
+          "models_ready",
+          "message"
+        ],
+        "title": "HealthResponse"
+      },
+      "ResolvedTerm": {
+        "properties": {
+          "original": {
+            "type": "string",
+            "title": "Original",
+            "description": "Исходный токен с опечаткой или сленгом"
+          },
+          "canonical": {
+            "type": "string",
+            "title": "Canonical",
+            "description": "Нормализованное значение из словаря"
+          },
+          "score": {
+            "type": "number",
+            "title": "Score",
+            "description": "Уверенность Fuzzy Matching (0-100)"
+          }
+        },
+        "type": "object",
+        "required": [
+          "original",
+          "canonical",
+          "score"
+        ],
+        "title": "ResolvedTerm"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "Core",
+      "description": "Эндпоинты для автотестов жюри и фронтенда"
+    },
+    {
+      "name": "System",
+      "description": "Мониторинг и управление сессиями"
+    }
+  ]
+}

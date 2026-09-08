@@ -1,0 +1,41 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - LLM_MODEL=${LLM_MODEL:-qwen2.5:14b}
+    healthcheck:
+      # $${LLM_MODEL} — с двойным знаком, чтобы compose не подставлял значение сам
+      test: ["CMD-SHELL", "ollama show $${LLM_MODEL}"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+    entrypoint: ["/bin/sh", "-c", "ollama serve & sleep 10 && ollama pull $${LLM_MODEL} && wait"]
+
+  gpn_assistant:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./chromadb:/app/chromadb
+      - hf_cache:/root/.cache/huggingface
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - LLM_MODEL=${LLM_MODEL:-qwen2.5:14b}
+      - LLM_NUM_CTX=${LLM_NUM_CTX:-8192}
+      - MAX_HISTORY_TURNS=${MAX_HISTORY_TURNS:-6}
+      - OLLAMA_MAX_RETRIES=${OLLAMA_MAX_RETRIES:-3}
+      - TRANSFORMERS_OFFLINE=0
+      - HF_HUB_DISABLE_TELEMETRY=1
+
+volumes:
+  ollama_data:
+  hf_cache:
