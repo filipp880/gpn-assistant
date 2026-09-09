@@ -8,4 +8,6 @@ fastapi
 uvicorn
 httpx
 python-multipart
+langfuse
+redis
 pytest

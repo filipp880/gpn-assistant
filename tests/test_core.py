@@ -9,6 +9,8 @@ from core import (
     normalize_token,
     resolve_slang_terms,
     OkapiBM25,
+    parent_child_chunk,
+    estimate_top_k,
 )
 
 DICT = {
@@ -275,3 +277,61 @@ def test_ordinary_latin_word_not_false_positive():
     # Обычные латинские слова не должны случайно сопоставляться со словарём
     _, terms = resolve_slang_terms("переведи слово COVID", DICT)
     assert terms == []
+
+
+# --- parent_child_chunk ---
+def test_parent_child_small_text_single_family():
+    # Короткий текст — один parent, который сам является единственным child
+    text = "Короткий документ о компании."
+    families = parent_child_chunk(text)
+    assert len(families) == 1
+    parent, children = families[0]
+    assert children == [parent]
+
+
+def test_parent_child_large_text_splits_into_children():
+    # Длинный parent делится на несколько overlapping children
+    text = ("ГПА-16 — газоперекачивающий агрегат. Мощность 16 МВт. "
+            "Давление 75 атм. Температура до 45 градусов. ") * 30
+    families = parent_child_chunk(text, parent_size=200, child_size=80, overlap=20)
+    assert families
+    for parent, children in families:
+        assert len(children) >= 2  # каждый parent > child_size даёт минимум 2 child
+        assert all(children)  # нет пустых
+
+
+def test_parent_child_children_within_parent():
+    # Каждый child — подстрока своего parent
+    text = ("ГПА-16 — газоперекачивающий агрегат. Мощность 16 МВт. "
+            "Давление 75 атм. Температура до 45 градусов. ") * 30
+    families = parent_child_chunk(text, parent_size=200, child_size=80, overlap=20)
+    for parent, children in families:
+        for child in children:
+            assert child in parent
+
+
+def test_parent_child_empty_text():
+    assert parent_child_chunk("") == []
+
+
+# --- estimate_top_k ---
+def test_estimate_top_k_short_query_small():
+    assert estimate_top_k("ГПН") < estimate_top_k("Сравни характеристики ГПА-16 и ГПА-25")
+
+
+def test_estimate_top_k_bounds():
+    # Не выходит за границы [min_k, max_k]
+    for q in ["", "а", "EBITDA", "Что такое EBITDA" * 5, "а "*50]:
+        assert 2 <= estimate_top_k(q) <= 8
+
+
+def test_estimate_top_k_complex_query_higher():
+    simple = estimate_top_k("Что такое EBITDA")
+    complex_q = estimate_top_k("Сравни характеристики ГПА-16 и ГПА-25 по мощности, давлению и температуре")
+    assert complex_q > simple
+
+
+def test_estimate_top_k_multiple_entities_higher():
+    one = estimate_top_k("Какая EBITDA у ГПНР")
+    many = estimate_top_k("Покажи EBITDA, выручку и прибыль ГПНР, ЦДНГ и НГДУ за 2025")
+    assert many >= one

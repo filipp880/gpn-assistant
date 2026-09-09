@@ -13,6 +13,60 @@ from rapidfuzz import process, fuzz
 
 _SEP_RE = re.compile(r"[^А-Яа-яЁёA-Za-z0-9]+")
 
+
+# --- Dynamic top_k ---
+_MIN_TOP_K = 2
+_MAX_TOP_K = 8
+_complexity_re = re.compile(
+    r"(сравни|сравнение|разниц|отличи|характеристик|описani|список|перечень"
+    r"|какие|каких|какой|какого|какова|сколько|когда|где|почему|зачем"
+    r"|расскажи|опиши|приведи|назови|в чем|что такое|определ)",
+    re.IGNORECASE,
+)
+
+
+def estimate_top_k(query: str, min_k: int = _MIN_TOP_K, max_k: int = _MAX_TOP_K) -> int:
+    """Адаптивный top_k в зависимости от сложности запроса.
+
+    Простые фактоидные запросы ("что такое EBITDA") → min_k (2-3).
+    Сложные многоаспектные ("сравни характеристики ГПА-16 и ГПА-25") → max_k (7-8).
+
+    Критерии:
+    - Длина запроса (количество слов)
+    - Наличие вопросительных/сравнительных конструкций
+    - Количество сущностей (капс/аббревиатур)
+    """
+    words = query.split()
+    word_count = len(words)
+
+    # Базовый score по длине
+    if word_count <= 3:
+        score = 0.2
+    elif word_count <= 6:
+        score = 0.4
+    elif word_count <= 10:
+        score = 0.6
+    else:
+        score = 0.8
+
+    # Многоаспектные запросы (сравнение, списки, несколько вопросов)
+    if _complexity_re.search(query):
+        score += 0.15
+
+    # Несколько аббревиатур/сущностей (капс-слова = корпоративные термины)
+    caps_count = sum(1 for w in words if w.isupper() and len(w) >= 2)
+    if caps_count >= 2:
+        score += 0.15
+    elif caps_count >= 1:
+        score += 0.05
+
+    # Перечисления через запятую/точку с запятой
+    if re.search(r"[,;]", query):
+        score += 0.1
+
+    score = max(0.0, min(1.0, score))
+    return min_k + int(score * (max_k - min_k))
+
 # Видимые омонимы латиница/кириллица (для ошибочно набранных аббревиатур «ГПH», «ГАЗПРОМ»).
 # Срабатывают только на ВЕРХНЕМ регистре. Намеренно без I/L/D/R — они дают ложно-положительные
 # совпадения на обычных латинских словах (IT, RAG, COVID и т.п.).
@@ -87,6 +141,38 @@ def adaptive_chunk(text: str, max_chunk: int = 500) -> list[str]:
     if current:
         chunks.append(" ".join(current))
     return [c for c in chunks if c]
+
+
+def parent_child_chunk(
+    text: str, parent_size: int = 2000, child_size: int = 500, overlap: int = 100,
+) -> list[tuple[str, list[str]]]:
+    """Parent-Child чанкинг: большие родительские чанки с мелкими дочерними.
+
+    Каждый parent разбивается на overlapping children для индексации.
+    Поиск идёт по children, но LLM видит parent целиком.
+
+    Возвращает: [(parent_text, [child_1, child_2, ...]), ...]
+    """
+    # Step 1: разбить документ на parent chunks (по предложениям/абзацам)
+    raw_parents = adaptive_chunk(text, max_chunk=parent_size)
+
+    result = []
+    for parent_text in raw_parents:
+        if len(parent_text) <= child_size:
+            # Parent足够小 — он сам является единственным child
+            result.append((parent_text, [parent_text]))
+            continue
+
+        # Step 2: разбить parent на overlapping children
+        children = []
+        step = child_size - overlap
+        for i in range(0, len(parent_text), step):
+            child = parent_text[i:i + child_size].strip()
+            if child:
+                children.append(child)
+        result.append((parent_text, children))
+
+    return result
 
 
 def _heading_of(line: str, standalone: bool = False) -> str | None:

@@ -7,7 +7,8 @@ import sys
 
 import chromadb
 
-from core import weighted_rrf_fusion, OkapiBM25
+from core import weighted_rrf_fusion, OkapiBM25, estimate_top_k
+from tracing import create_span
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 DENSE_DIM = 1024  # размерность dense-эмбеддингов BGE-M3
 # Файл параметров лежит внутри тома ./chromadb: переживает рестарт контейнера.
 TUNING_FILE = os.path.join("chromadb", "retrieval_tuning.json")
+PARENT_MAP_FILE = os.path.join("chromadb", "parent_map.json")
 
 # Параметры retrieval. Дефолты (dense 1.0, sparse 0.8, top_k 3) — эвристики; система
 # сама переподбирает их, когда меняются документы: ingest()/POST /reindex считают отпечаток
@@ -43,6 +45,7 @@ _store_initialized = False
 
 _bge_m3 = None
 _reranker = None
+_parent_map = {}  # parent_id → parent_text (загружается из parent_map.json)
 
 # --- Кэш результатов поиска ---
 # Полный кэш (энкод BGE-M3 + ChromaDB + реранкинг) для повторных одинаковых запросов.
@@ -130,6 +133,24 @@ def reload_store() -> None:
     # Применяем подобранные параметры (из chromadb/retrieval_tuning.json), если есть
     load_tuning()
 
+    # Загружаем parent_map для parent-child chunking
+    _load_parent_map()
+
+
+def _load_parent_map() -> None:
+    """Загружает parent_id → parent_text mapping из parent_map.json."""
+    global _parent_map
+    if not os.path.exists(PARENT_MAP_FILE):
+        _parent_map = {}
+        return
+    try:
+        with open(PARENT_MAP_FILE, "r", encoding="utf-8") as f:
+            _parent_map = json.load(f)
+        logger.info("Parent map загружен: %d записей", len(_parent_map))
+    except Exception as e:
+        logger.warning("Не удалось загрузить parent_map (%s) — child-чанки будут возвращаться как есть", e)
+        _parent_map = {}
+
 
 def _ensure_store() -> None:
     """Однократная ленивая загрузка базы знаний при первом использовании."""
@@ -140,13 +161,16 @@ def _ensure_store() -> None:
     _store_initialized = True
 
 
-def rerank(query: str, docs: list[str], top_k: int = 3) -> list[str]:
+def rerank(query: str, docs: list[str], top_k: int = 3, trace=None) -> list[str]:
     if not docs:
         return []
-    pairs = [(query, doc) for doc in docs]
-    scores = get_reranker().predict(pairs)
-    ranked = sorted(zip(docs, scores), key=lambda x: -x[1])
-    return [doc for doc, _ in ranked[:top_k]]
+    with create_span(trace, "rerank", {"input_count": len(docs), "top_k": top_k}, input_data=query) as span:
+        pairs = [(query, doc) for doc in docs]
+        scores = get_reranker().predict(pairs)
+        ranked = sorted(zip(docs, scores), key=lambda x: -x[1])
+        result = [doc for doc, _ in ranked[:top_k]]
+        span.update(output={"output_count": len(result), "scores": [round(float(s), 4) for _, s in ranked[:top_k]]})
+        return result
 
 
 def _sparse_scores(query_weights: dict, doc_weights_list: list) -> list[float]:
@@ -194,78 +218,112 @@ def _cache_put(key: tuple, result: list) -> None:
         _SEARCH_CACHE.pop(old_key, None)
 
 
-def _do_search(query: str, top_k: int, use_reranker: bool) -> list:
+def _do_search(query: str, top_k: int, use_reranker: bool, trace=None) -> list:
     """Холодный путь: BGE-M3 энкод + ChromaDB + RRF + реранкинг."""
     _ensure_store()
     if not store_ready():
         return []
     model = get_bge_m3()
-    out = model.encode([query], return_dense=True, return_sparse=True)
-    q_dense = out["dense_vecs"][0]
-    q_sparse = out["lexical_weights"][0]
 
-    semantic_res = _collection.query(
-        query_embeddings=[q_dense.tolist()],
-        n_results=top_k * 8
-    )
-    semantic_ids = semantic_res["ids"][0] if semantic_res["ids"] else []
+    with create_span(trace, "dense_search", {"top_k": top_k * 8}, input_data=query) as span:
+        out = model.encode([query], return_dense=True, return_sparse=True)
+        q_dense = out["dense_vecs"][0]
+        q_sparse = out["lexical_weights"][0]
+        semantic_res = _collection.query(
+            query_embeddings=[q_dense.tolist()],
+            n_results=top_k * 8
+        )
+        semantic_ids = semantic_res["ids"][0] if semantic_res["ids"] else []
+        span.update(output={"results_count": len(semantic_ids)})
 
-    sp_scores = _sparse_scores(q_sparse, _doc_sparse)
-    lexical_ids = [
-        doc_id for doc_id, _ in sorted(
-            zip(_doc_ids, sp_scores), key=lambda x: x[1], reverse=True
-        )[:top_k * 8]
-    ]
-
-    # Третий канал: Okapi BM25 по леммам (точная лексика словоформ)
-    rankings = [semantic_ids, lexical_ids]
-    weights = [_fusion_weights[0], _fusion_weights[1]]
-    if _bm25 is not None:
-        bm25_scores = _bm25.get_scores(query)
-        bm25_ids = [
+    with create_span(trace, "sparse_search", {"top_k": top_k * 8}, input_data=query) as span:
+        sp_scores = _sparse_scores(q_sparse, _doc_sparse)
+        lexical_ids = [
             doc_id for doc_id, _ in sorted(
-                zip(_doc_ids, bm25_scores), key=lambda x: x[1], reverse=True
+                zip(_doc_ids, sp_scores), key=lambda x: x[1], reverse=True
             )[:top_k * 8]
         ]
-        rankings.append(bm25_ids)
-        weights.append(BM25_WEIGHT)
+        span.update(output={"results_count": len(lexical_ids)})
 
-    # Взвешенный RRF: веса каналов хранятся в _fusion_weights (см. tune_retrieval)
-    pool = 20 if use_reranker else top_k
-    final_ids = weighted_rrf_fusion(rankings, weights, top_k=pool)
+    rankings = [semantic_ids, lexical_ids]
+    weights = [_fusion_weights[0], _fusion_weights[1]]
+
+    with create_span(trace, "bm25_search", {"top_k": top_k * 8}, input_data=query) as span:
+        if _bm25 is not None:
+            bm25_scores = _bm25.get_scores(query)
+            bm25_ids = [
+                doc_id for doc_id, _ in sorted(
+                    zip(_doc_ids, bm25_scores), key=lambda x: x[1], reverse=True
+                )[:top_k * 8]
+            ]
+            rankings.append(bm25_ids)
+            weights.append(BM25_WEIGHT)
+            span.update(output={"results_count": len(bm25_ids)})
+        else:
+            span.update(output={"results_count": 0, "note": "BM25 not available"})
+
+    with create_span(trace, "rrf_fusion", {
+        "channels": len(rankings),
+        "weights": weights,
+        "pool_size": 20 if use_reranker else top_k,
+    }) as span:
+        pool = 20 if use_reranker else top_k
+        final_ids = weighted_rrf_fusion(rankings, weights, top_k=pool)
+        span.update(output={"fused_count": len(final_ids)})
+
     if not final_ids:
         return []
 
-    retrieved = _collection.get(ids=final_ids)
+    retrieved = _collection.get(ids=final_ids, include=["metadatas"])
     docs = retrieved["documents"]
-    sources = [m["source"] for m in retrieved["metadatas"]]
+    metadatas = retrieved["metadatas"]
+    sources = [m["source"] for m in metadatas]
+
+    # Parent-Child: заменяем child-чанки на parent-чанки для LLM
+    if _parent_map:
+        parent_ids_seen = set()
+        swapped_docs = []
+        swapped_sources = []
+        for doc, meta in zip(docs, metadatas):
+            pid = meta.get("parent_id")
+            if pid and pid in _parent_map and pid not in parent_ids_seen:
+                swapped_docs.append(_parent_map[pid])
+                swapped_sources.append(meta["source"])
+                parent_ids_seen.add(pid)
+            elif not pid:
+                # Старый формат (без parent_id) — оставляем как есть
+                swapped_docs.append(doc)
+                swapped_sources.append(meta["source"])
+        docs = swapped_docs
+        sources = swapped_sources
+
     if use_reranker:
-        ranked = rerank(query, docs, top_k=top_k)
+        ranked = rerank(query, docs, top_k=top_k, trace=trace)
         doc_to_src = dict(zip(docs, sources))
         return [(d, doc_to_src[d]) for d in ranked]
     return list(zip(docs, sources))
 
 
-def hybrid_search(query: str, top_k: int | None = None, use_reranker: bool = True) -> list:
+def hybrid_search(query: str, top_k: int | None = None, use_reranker: bool = True, trace=None) -> list:
     """Гибридный поиск: dense + sparse от BGE-M3, взвешенный RRF, реранкинг.
 
     Повторные одинаковые запросы (жюри/test-скрипты часто задают одно и то же)
     отдаются из кэша за доли миллисекунды — энкод, ChromaDB и реранкер не вызываются.
     Кэш самоинвалидируется при изменении data/ или параметров (см. _state_mark).
-    Если top_k не задан — берётся подобранный (см. TUNING_FILE).
+    Если top_k не задан — подбирается автоматически по сложности запроса.
     """
     _ensure_store()
     if not store_ready():
         return []
     if top_k is None:
-        top_k = _default_top_k
+        top_k = estimate_top_k(query)
 
     key = (query, top_k, use_reranker, _state_mark())
     cached = _SEARCH_CACHE.get(key)
     if cached is not None:
         return cached
 
-    result = _do_search(query, top_k, use_reranker)
+    result = _do_search(query, top_k, use_reranker, trace=trace)
     if result:  # пустые (например, во время инициализации) не кэшируем
         _cache_put(key, result)
     return result

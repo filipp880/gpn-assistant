@@ -1,13 +1,14 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 import uuid
 import logging
 import asyncio
 import os
 from datetime import datetime
 import httpx
+from tracing import trace_query, flush as trace_flush
 
 # --- Настройка логирования ---
 logging.basicConfig(
@@ -64,21 +65,21 @@ class HealthResponse(BaseModel):
     models_ready: bool
     message: str
 
-# --- In-Memory Storage для истории сессий ---
-# Для хакатона этого достаточно. В проде заменяем на Redis/PostgreSQL.
-sessions_store: Dict[str, List[Dict[str, Any]]] = {}
+# --- Persistent Session Storage (Redis + in-memory fallback) ---
+from sessions import SessionStore
+store = SessionStore(os.getenv("REDIS_URL"))
 
 # --- АДАПТЕР К ТВОЕМУ КОДУ ---
-def _run_sync_agent(query: str, session_id: str, history: list) -> dict:
+def _run_sync_agent(query: str, session_id: str, history: list, trace=None) -> dict:
     from agent import run_my_agent_logic
-    return run_my_agent_logic(query, session_id, history)
+    return run_my_agent_logic(query, session_id, history, trace=trace)
 
 
-async def execute_agent(query: str, session_id: str) -> dict:
+async def execute_agent(query: str, session_id: str, trace=None) -> dict:
     """Запускает синхронный код агента в отдельном потоке, не блокируя FastAPI"""
-    history = sessions_store.get(session_id, [])
+    history = store.get_history(session_id)
     # asyncio.to_thread - спасение для синхронных LLM/ChromaDB вызовов в FastAPI
-    result = await asyncio.to_thread(_run_sync_agent, query, session_id, history)
+    result = await asyncio.to_thread(_run_sync_agent, query, session_id, history, trace=trace)
     return result
 
 
@@ -88,23 +89,27 @@ async def chat_endpoint(request: ChatRequest):
     start_time = datetime.now()
     session_id = request.session_id or str(uuid.uuid4())
     
-    if session_id not in sessions_store:
-        sessions_store[session_id] = []
-        
-    sessions_store[session_id].append({"role": "user", "content": request.query})
+    store.append_message(session_id, "user", request.query)
     logger.info(f"[{session_id}] Запрос: {request.query}")
     
-    try:
-        agent_result = await execute_agent(request.query, session_id)
-    except Exception as e:
-        logger.error(f"[{session_id}] Ошибка: {str(e)}")
-        from agent import OllamaUnavailableError
-        if isinstance(e, OllamaUnavailableError):
-            model = os.getenv("LLM_MODEL", "qwen2.5:14b")
-            detail = f"Ollama недоступна. Проверьте, что сервис запущен и модель {model} загружена."
-            raise HTTPException(status_code=503, detail=detail)
-        raise HTTPException(status_code=500, detail=str(e))
-        
+    with trace_query(request.query, session_id) as trace:
+        try:
+            agent_result = await execute_agent(request.query, session_id, trace=trace)
+            trace.update(output={
+                "answer": agent_result.get("answer", ""),
+                "sources": agent_result.get("sources", []),
+                "resolved_terms": agent_result.get("resolved_terms", []),
+            })
+        except Exception as e:
+            logger.error(f"[{session_id}] Ошибка: {str(e)}")
+            trace.update(metadata={"error": str(e)})
+            from agent import OllamaUnavailableError
+            if isinstance(e, OllamaUnavailableError):
+                model = os.getenv("LLM_MODEL", "qwen2.5:14b")
+                detail = f"Ollama недоступна. Проверьте, что сервис запущен и модель {model} загружена."
+                raise HTTPException(status_code=503, detail=detail)
+            raise HTTPException(status_code=500, detail=str(e))
+            
     end_time = datetime.now()
     latency_ms = (end_time - start_time).total_seconds() * 1000
     logger.info("[%s] ответ за %.0f мс | источники: %s | терминов: %d",
@@ -112,7 +117,7 @@ async def chat_endpoint(request: ChatRequest):
                 agent_result.get("sources", []),
                 len(agent_result.get("resolved_terms", [])))
 
-    sessions_store[session_id].append({"role": "assistant", "content": agent_result.get("answer", "")})
+    store.append_message(session_id, "assistant", agent_result.get("answer", ""))
     
     return ChatResponse(
         session_id=session_id,
@@ -125,14 +130,13 @@ async def chat_endpoint(request: ChatRequest):
 
 @app.get("/history/{session_id}", tags=["System"])
 async def get_history(session_id: str):
-    if session_id not in sessions_store:
+    if not store.exists(session_id):
         raise HTTPException(status_code=404, detail="Сессия не найдена")
-    return {"session_id": session_id, "history": sessions_store[session_id]}
+    return {"session_id": session_id, "history": store.get_history(session_id)}
 
 @app.delete("/history/{session_id}", tags=["System"])
 async def clear_history(session_id: str):
-    if session_id in sessions_store:
-        del sessions_store[session_id]
+    store.delete(session_id)
     return {"status": "success"}
 
 @app.get("/health", response_model=HealthResponse, tags=["System"])
@@ -187,7 +191,13 @@ async def reindex():
 @app.on_event("startup")
 async def startup_event():
     logger.info("Сервер GPN Assistant запущен. Swagger UI: http://localhost:8000/docs")
-    # Здесь можно вызвать pre-load векторной БД, чтобы первый запрос не был долгим
+    # Инициализация Langfuse tracing (lazy, если ключи заданы)
+    from tracing import get_langfuse
+    get_langfuse()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    trace_flush()
 
 @app.on_event("startup")
 async def warmup_models():

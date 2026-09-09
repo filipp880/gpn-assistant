@@ -16,6 +16,33 @@ services:
       start_period: 20s
     entrypoint: ["/bin/sh", "-c", "ollama serve & sleep 10 && ollama pull $${LLM_MODEL} && wait"]
 
+  langfuse-db:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=${LANGFUSE_DB_USER:-langfuse}
+      - POSTGRES_PASSWORD=${LANGFUSE_DB_PASSWORD:-langfuse_secret}
+      - POSTGRES_DB=langfuse
+    volumes:
+      - langfuse_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  langfuse:
+    image: langfuse/langfuse:2
+    ports:
+      - "3000:3000"
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://langfuse:langfuse_secret@langfuse-db:5432/langfuse
+      - NEXTAUTH_SECRET=${NEXTAUTH_SECRET:-hackathon-random-secret-change-me}
+      - NEXTAUTH_URL=http://localhost:3000
+      - SALT=${LANGFUSE_SALT:-hackathon-salt-change-me}
+
   gpn_assistant:
     build: .
     ports:
@@ -27,6 +54,8 @@ services:
     depends_on:
       ollama:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       - OLLAMA_HOST=http://ollama:11434
       - LLM_MODEL=${LLM_MODEL:-qwen2.5:14b}
@@ -35,7 +64,27 @@ services:
       - OLLAMA_MAX_RETRIES=${OLLAMA_MAX_RETRIES:-3}
       - TRANSFORMERS_OFFLINE=0
       - HF_HUB_DISABLE_TELEMETRY=1
+      # Redis
+      - REDIS_URL=redis://redis:6379/0
+      # Langfuse tracing (опционально)
+      - LANGFUSE_HOST=http://langfuse:3000
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
 volumes:
   ollama_data:
   hf_cache:
+  langfuse_data:
+  redis_data:
