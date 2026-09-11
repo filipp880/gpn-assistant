@@ -23,7 +23,7 @@ class GpnAgent:
     LLM_MAX_CONTEXT = 32000
 
     def __init__(self):
-        self.model_name = os.getenv("LLM_MODEL", "qwen2.5:14b")
+        self.model_name = os.getenv("LLM_MODEL", "gemma4:e2b-it-qat")
         self.num_ctx = int(os.getenv("LLM_NUM_CTX", "8192"))
         if self.num_ctx > self.LLM_MAX_CONTEXT:
             logger.warning(

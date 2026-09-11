@@ -105,7 +105,7 @@ async def chat_endpoint(request: ChatRequest):
             trace.update(metadata={"error": str(e)})
             from agent import OllamaUnavailableError
             if isinstance(e, OllamaUnavailableError):
-                model = os.getenv("LLM_MODEL", "qwen2.5:14b")
+                model = os.getenv("LLM_MODEL", "gemma4:e2b-it-qat")
                 detail = f"Ollama недоступна. Проверьте, что сервис запущен и модель {model} загружена."
                 raise HTTPException(status_code=503, detail=detail)
             raise HTTPException(status_code=500, detail=str(e))
