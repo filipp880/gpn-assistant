@@ -18,6 +18,16 @@ class OllamaUnavailableError(Exception):
     pass
 
 
+# Путь к словарю — единый источник истины для чтения и записи.
+DICTIONARY_FILE = "corporate_dictionary.json"
+
+
+def save_dictionary(dictionary: dict) -> None:
+    """Сохраняет словарь в corporate_dictionary.json (используется при редактировании)."""
+    with open(DICTIONARY_FILE, "w", encoding="utf-8") as f:
+        json.dump(dictionary, f, ensure_ascii=False, indent=2)
+
+
 class GpnAgent:
     # Ограничение хакатона: контекстное окно модели — не более 32 000 токенов.
     LLM_MAX_CONTEXT = 32000
@@ -45,7 +55,7 @@ class GpnAgent:
 
     def _load_dictionary(self) -> dict:
         """Загружает словарь аббревиатур. Если файла нет, использует дефолтный для тестов жюри."""
-        path = "corporate_dictionary.json"
+        path = DICTIONARY_FILE
         if os.path.exists(path):
             try:
                 with open(path, 'r', encoding='utf-8') as f:

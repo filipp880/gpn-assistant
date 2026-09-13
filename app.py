@@ -1,12 +1,14 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Dict
 import uuid
 import logging
 import asyncio
 import os
+import re
 from datetime import datetime
+from io import BytesIO
 import httpx
 from tracing import trace_query, flush as trace_flush
 
@@ -64,6 +66,14 @@ class HealthResponse(BaseModel):
     db_status: str
     models_ready: bool
     message: str
+
+class DictionaryItem(BaseModel):
+    key: str = Field(..., description="Аббревиатура/термин", example="КРС")
+    value: str = Field(..., description="Расшифровка/значение", example="Капитальный ремонт скважин")
+
+class DictionaryResponse(BaseModel):
+    count: int
+    dictionary: Dict[str, str]
 
 # --- Persistent Session Storage (Redis + in-memory fallback) ---
 from sessions import SessionStore
@@ -175,18 +185,123 @@ async def reindex():
 
     Нужно после добавления/изменения файлов в data/ — без перезапуска сервиса.
     """
-    def _rebuild():
-        import ingest
-        ingest.main()
-        from retrieval import reload_store
-        reload_store()
-
     try:
-        await asyncio.to_thread(_rebuild)
+        await asyncio.to_thread(_rebuild_index)
         return {"status": "success", "message": "Индекс пересобран из data/"}
     except Exception as e:
         logger.error(f"Ошибка переиндексации: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Ошибка переиндексации: {str(e)}")
+
+
+# --- Корпоративный словарь (редактирование) ---
+
+@app.get("/dictionary", response_model=DictionaryResponse, tags=["System"])
+async def get_dictionary():
+    """Возвращает корпоративный словарь аббревиатур."""
+    from agent import agent_instance
+    return {"count": len(agent_instance.dictionary), "dictionary": agent_instance.dictionary}
+
+
+@app.put("/dictionary", response_model=DictionaryResponse, tags=["System"])
+async def replace_dictionary(items: Dict[str, str]):
+    """Полностью заменяет словарь: {аббревиатура: расшифровка}."""
+    from agent import agent_instance, save_dictionary
+    cleaned = {
+        k.strip(): v.strip()
+        for k, v in items.items()
+        if k and k.strip() and v and v.strip()
+    }
+    agent_instance.dictionary = cleaned
+    save_dictionary(cleaned)
+    logger.info("Словарь заменён полностью: %d терминов", len(cleaned))
+    return {"count": len(cleaned), "dictionary": cleaned}
+
+
+@app.post("/dictionary", response_model=DictionaryResponse, tags=["System"])
+async def upsert_dictionary_item(item: DictionaryItem):
+    """Добавляет или обновляет один термин словаря."""
+    from agent import agent_instance, save_dictionary
+    key = item.key.strip()
+    value = item.value.strip()
+    if not key or not value:
+        raise HTTPException(status_code=422, detail="key и value не должны быть пустыми")
+    agent_instance.dictionary[key] = value
+    save_dictionary(agent_instance.dictionary)
+    logger.info("Словарь: добавлено/обновлено '%s' -> '%s'", key, value)
+    return {"count": len(agent_instance.dictionary), "dictionary": agent_instance.dictionary}
+
+
+@app.delete("/dictionary/{key}", response_model=DictionaryResponse, tags=["System"])
+async def delete_dictionary_item(key: str):
+    """Удаляет термин из словаря."""
+    from agent import agent_instance, save_dictionary
+    removed = agent_instance.dictionary.pop(key, None)
+    if removed is None:
+        raise HTTPException(status_code=404, detail=f"Термин '{key}' не найден")
+    save_dictionary(agent_instance.dictionary)
+    logger.info("Словарь: удалён термин '%s'", key)
+    return {"count": len(agent_instance.dictionary), "dictionary": agent_instance.dictionary}
+
+
+# --- Загрузка документов ---
+
+_ALLOWED_UPLOAD_EXT = {".pdf", ".txt"}
+
+
+def _rebuild_index() -> None:
+    """Перечитывает data/ и перестраивает индекс (общий для /reindex и /upload)."""
+    import ingest
+    ingest.main()
+    from retrieval import reload_store
+    reload_store()
+
+
+@app.post("/upload", tags=["System"])
+async def upload_document(file: UploadFile = File(..., description="PDF или TXT документ")):
+    """Загружает документ (PDF/TXT) в базу знаний и пересобирает индекс."""
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in _ALLOWED_UPLOAD_EXT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Допустимые форматы: PDF, TXT (получено: '{ext or 'без расширения'}')",
+        )
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Пустой файл")
+
+    if ext == ".pdf":
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(BytesIO(content))
+            if len(reader.pages) == 0:
+                raise ValueError("в PDF нет страниц")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Не удалось прочитать PDF: {e}")
+
+    os.makedirs("data", exist_ok=True)
+    base_name = os.path.basename(file.filename or "upload")
+    safe_name = re.sub(r"[^\w.()-]", "_", base_name).strip("_")
+    if not os.path.splitext(safe_name)[1].lower():
+        safe_name += ext
+    safe_name = safe_name or f"upload{ext}"
+    path = os.path.join("data", safe_name)
+
+    with open(path, "wb") as f:
+        f.write(content)
+    logger.info("Загружен документ: %s (%d байт)", path, len(content))
+
+    try:
+        await asyncio.to_thread(_rebuild_index)
+    except Exception as e:
+        logger.error("Ошибка переиндексации после загрузки: %s", e)
+        raise HTTPException(status_code=500, detail=f"Ошибка переиндексации: {e}")
+
+    return {
+        "status": "success",
+        "file": path,
+        "message": "Документ сохранён и индекс пересобран",
+    }
 
 @app.on_event("startup")
 async def startup_event():
