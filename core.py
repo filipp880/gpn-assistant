@@ -218,13 +218,19 @@ class OkapiBM25:
         self.k1 = k1
         self.b = b
         self.N = len(corpus)
-        self.doc_tf: list[Counter] = []
+        # Инвертированный индекс: токен -> список (индекс_документа, tf).
+        # Скоринг идёт только по постинг-листам токенов запроса, а не по всему корпусу.
+        self.postings: dict[str, list[tuple[int, int]]] = {}
+        self.doc_len: list[int] = []
         df: Counter = Counter()
         total_len = 0
-        for doc in corpus:
+        for doc_idx, doc in enumerate(corpus):
             tf = Counter(tokenize_lemmas(doc))
-            self.doc_tf.append(tf)
-            total_len += sum(tf.values())
+            dl = sum(tf.values())
+            self.doc_len.append(dl)
+            total_len += dl
+            for term, f in tf.items():
+                self.postings.setdefault(term, []).append((doc_idx, f))
             df.update(tf.keys())
         self.avgdl = total_len / self.N if self.N else 0.0
         self.idf = {
@@ -233,20 +239,26 @@ class OkapiBM25:
         }
 
     def get_scores(self, query: str) -> list[float]:
-        """Скоринг всех документов корпуса под запрос (леммы)."""
-        q = Counter(tokenize_lemmas(query))
-        out = []
-        for tf in self.doc_tf:
-            dl = sum(tf.values())
-            norm = dl / self.avgdl if self.avgdl else 0.0
-            score = 0.0
-            for t, qtf in q.items():
-                f = tf.get(t, 0)
-                if f == 0:
-                    continue
+        """Скоринг документов под запрос (леммы) по инвертированному индексу.
+
+        Результат идентичен полному перебору корпуса: документы без токенов
+        запроса дают вклад 0 и остаются с нулевым скором.
+        """
+        out = [0.0] * self.N
+        q = set(tokenize_lemmas(query))
+        norm_cache: dict[int, float] = {}
+        for t in q:
+            idf = self.idf.get(t)
+            if idf is None:
+                continue
+            for doc_idx, f in self.postings.get(t, ()):
+                norm = norm_cache.get(doc_idx)
+                if norm is None:
+                    dl = self.doc_len[doc_idx]
+                    norm = dl / self.avgdl if self.avgdl else 0.0
+                    norm_cache[doc_idx] = norm
                 denom = f + self.k1 * (1 - self.b + self.b * norm)
-                score += self.idf.get(t, 0.0) * (f * (self.k1 + 1)) / denom
-            out.append(score)
+                out[doc_idx] += idf * (f * (self.k1 + 1)) / denom
         return out
 
 

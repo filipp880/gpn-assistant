@@ -26,6 +26,20 @@ DENSE_DIM = 1024  # размерность dense-эмбеддингов BGE-M3
 TUNING_FILE = os.path.join("chromadb", "retrieval_tuning.json")
 PARENT_MAP_FILE = os.path.join("chromadb", "parent_map.json")
 
+# Расширения документов базы знаний. Единый список для ingest, fingerprint и кэша.
+_KNOWLEDGE_EXT = {".txt", ".pdf"}
+
+
+def _knowledge_files(data_dir: str = "data") -> list[str]:
+    """Отсортированный список файлов базы знаний (txt/pdf) в data/."""
+    if not os.path.isdir(data_dir):
+        return []
+    return sorted(
+        name for name in os.listdir(data_dir)
+        if os.path.isfile(os.path.join(data_dir, name))
+        and os.path.splitext(name)[1].lower() in _KNOWLEDGE_EXT
+    )
+
 # Параметры retrieval. Дефолты (dense 1.0, sparse 0.8, top_k 3) — эвристики; система
 # сама переподбирает их, когда меняются документы: ingest()/POST /reindex считают отпечаток
 # data/*.txt, сравнивают с сохранённым в TUNING_FILE и при отличии запускают grid-search
@@ -39,7 +53,7 @@ _client = None
 _collection = None
 _doc_ids = []
 _docs = []
-_doc_sparse = None  # list[dict[token_id, weight]] — sparse-индекс от BGE-M3
+_doc_sparse = None  # dict[token -> list[(doc_idx, weight)]] — inverted sparse-индекс от BGE-M3
 _bm25 = None        # OkapiBM25 по леммам (третий канал) или None
 _store_initialized = False
 
@@ -118,9 +132,15 @@ def reload_store() -> None:
         _bm25 = None
         return
 
-    # Sparse-индекс: лексические веса BGE-M3 для всех документов
+    # Sparse-индекс: лексические веса BGE-M3 всех документов → инвертированный
+    # (токен → [(индекс_документа, вес)]). Так скоринг обходит только постинг-листы
+    # токенов запроса, а не весь корпус.
     out = get_bge_m3().encode(_docs, return_dense=False, return_sparse=True)
-    _doc_sparse = out["lexical_weights"]
+    inverted = {}
+    for doc_idx, weights in enumerate(out["lexical_weights"]):
+        for tok, w in weights.items():
+            inverted.setdefault(tok, []).append((doc_idx, w))
+    _doc_sparse = inverted
 
     # Третий канал: Okapi BM25 по леммам. Тяжёлых зависимостей нет; если что-то
     # пошло не так — продолжаем на двух каналах.
@@ -173,16 +193,16 @@ def rerank(query: str, docs: list[str], top_k: int = 3, trace=None) -> list[str]
         return result
 
 
-def _sparse_scores(query_weights: dict, doc_weights_list: list) -> list[float]:
-    """SPLADE-подобный скоринг: сумма произведений весов по пересечению токенов."""
-    scores = []
-    for dw in doc_weights_list:
-        total = 0.0
-        for tok, qw in query_weights.items():
-            w = dw.get(tok)
-            if w:
-                total += qw * w
-        scores.append(total)
+def _sparse_scores(query_weights: dict, inverted_index: dict, n_docs: int) -> list[float]:
+    """SPLADE-подобный скоринг по инвертированному индексу.
+
+    Сумма произведений весов по пересечению токенов запроса с постинг-листами.
+    Идентично прежней формуле по всему корпусу, но обходит лишь релевантные документы.
+    """
+    scores = [0.0] * n_docs
+    for tok, qw in query_weights.items():
+        for doc_idx, w in inverted_index.get(tok, ()):
+            scores[doc_idx] += qw * w
     return scores
 
 
@@ -193,12 +213,10 @@ def _state_mark() -> tuple:
     при смене данных/весов кэш автоматически «протухает» для всех запросов.
     """
     marks = []
-    if os.path.isdir("data"):
-        for name in sorted(os.listdir("data")):
-            p = os.path.join("data", name)
-            if os.path.isfile(p) and name.endswith(".txt"):
-                st = os.stat(p)
-                marks.append((name, st.st_mtime_ns, st.st_size))
+    for name in _knowledge_files("data"):
+        p = os.path.join("data", name)
+        st = os.stat(p)
+        marks.append((name, st.st_mtime_ns, st.st_size))
     try:
         st = os.stat(TUNING_FILE)
         marks.append(("tuning", st.st_mtime_ns, st.st_size))
@@ -237,7 +255,7 @@ def _do_search(query: str, top_k: int, use_reranker: bool, trace=None) -> list:
         span.update(output={"results_count": len(semantic_ids)})
 
     with create_span(trace, "sparse_search", {"top_k": top_k * 8}, input_data=query) as span:
-        sp_scores = _sparse_scores(q_sparse, _doc_sparse)
+        sp_scores = _sparse_scores(q_sparse, _doc_sparse, len(_doc_ids))
         lexical_ids = [
             doc_id for doc_id, _ in sorted(
                 zip(_doc_ids, sp_scores), key=lambda x: x[1], reverse=True
@@ -490,16 +508,13 @@ def tune_retrieval(
 
 
 def _data_fingerprint(data_dir: str = "data") -> str:
-    """Хеш содержимого data/*.txt — по его изменению система понимает, что документы обновились."""
+    """Хеш содержимого файлов базы знаний (txt/pdf) — по его изменению система понимает, что документы обновились."""
     h = hashlib.sha256()
-    if not os.path.isdir(data_dir):
-        return h.hexdigest()
-    for name in sorted(os.listdir(data_dir)):
+    for name in _knowledge_files(data_dir):
         p = os.path.join(data_dir, name)
-        if os.path.isfile(p) and name.endswith(".txt"):
-            h.update(name.encode("utf-8"))
-            with open(p, "rb") as f:
-                h.update(f.read())
+        h.update(name.encode("utf-8"))
+        with open(p, "rb") as f:
+            h.update(f.read())
     return h.hexdigest()
 
 

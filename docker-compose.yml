@@ -6,7 +6,7 @@ services:
     volumes:
       - ollama_data:/root/.ollama
     environment:
-      - LLM_MODEL=${LLM_MODEL:-qwen2.5:14b}
+      - LLM_MODEL=${LLM_MODEL:-gemma4:e2b-it-qat}
     healthcheck:
       # $${LLM_MODEL} — с двойным знаком, чтобы compose не подставлял значение сам
       test: ["CMD-SHELL", "ollama show $${LLM_MODEL}"]
@@ -58,7 +58,7 @@ services:
         condition: service_healthy
     environment:
       - OLLAMA_HOST=http://ollama:11434
-      - LLM_MODEL=${LLM_MODEL:-qwen2.5:14b}
+      - LLM_MODEL=${LLM_MODEL:-gemma4:e2b-it-qat}
       - LLM_NUM_CTX=${LLM_NUM_CTX:-8192}
       - MAX_HISTORY_TURNS=${MAX_HISTORY_TURNS:-6}
       - OLLAMA_MAX_RETRIES=${OLLAMA_MAX_RETRIES:-3}

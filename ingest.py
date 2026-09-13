@@ -3,11 +3,22 @@ import logging
 import os
 import chromadb
 from core import parent_child_chunk
-from retrieval import get_bge_m3, auto_tune_if_data_changed
+from retrieval import get_bge_m3, auto_tune_if_data_changed, DENSE_DIM, _data_fingerprint, _knowledge_files
 
 logger = logging.getLogger(__name__)
 
 PARENT_MAP_FILE = os.path.join("chromadb", "parent_map.json")
+
+
+def _read_document(path: str, name: str) -> str:
+    """Извлекает текст из txt или pdf документа."""
+    if name.lower().endswith(".pdf"):
+        from pypdf import PdfReader
+        reader = PdfReader(path)
+        pages = [page.extract_text() or "" for page in reader.pages]
+        return "\n".join(pages)
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
 
 
 def main():
@@ -37,46 +48,84 @@ def main():
         logger.warning("Не найдена директория data/ — база знаний не построена.")
         return
 
+    fingerprint = _data_fingerprint(data_dir)
+
+    # --- Инкрементальный ingest ---
+    # Если документы не менялись, база совместима по размерности и parent_map на
+    # месте — пересобирать нечего: старт контейнера не тратит время на ре-энкод.
+    try:
+        existing = client.get_collection('kbase')
+    except Exception:
+        existing = None
+
+    if existing is not None:
+        meta = existing.metadata or {}
+        same_dim = True
+        try:
+            sample = existing.get(limit=1, include=["embeddings"])
+            emb = sample["embeddings"][0] if sample["embeddings"] else None
+            same_dim = emb is None or len(emb) == DENSE_DIM
+        except Exception:
+            same_dim = False
+        if (meta.get("data_fingerprint") == fingerprint
+                and same_dim
+                and os.path.exists(PARENT_MAP_FILE)):
+            logger.info(
+                "Документы не менялись (fingerprint совпадает) — база знаний не пересобирается"
+            )
+            return
+
+    try:
+        client.delete_collection('kbase')
+    except Exception:
+        pass
+
+    collection = client.create_collection(
+        name='kbase',
+        metadata={"hnsw:space": "cosine", "data_fingerprint": fingerprint}
+    )
+
     model = get_bge_m3()
     parent_map = {}  # parent_id → parent_text
 
-    for fname in os.listdir(data_dir):
+    for fname in _knowledge_files(data_dir):
         fpath = os.path.join(data_dir, fname)
-        if os.path.isfile(fpath) and fname.endswith('.txt'):
-            with open(fpath, 'r', encoding='utf-8') as f:
-                text = f.read()
+        text = _read_document(fpath, fname)
+        if not text.strip():
+            logger.warning("%s: пустой текст (возможно, PDF сканирован) — пропущен", fname)
+            continue
 
-            families = parent_child_chunk(text)
+        families = parent_child_chunk(text)
 
-            if not families:
-                continue
+        if not families:
+            continue
 
-            child_docs = []
-            child_ids = []
-            child_metadatas = []
+        child_docs = []
+        child_ids = []
+        child_metadatas = []
 
-            for parent_idx, (parent_text, children) in enumerate(families):
-                parent_id = f"{fname}_p{parent_idx}"
-                parent_map[parent_id] = parent_text
+        for parent_idx, (parent_text, children) in enumerate(families):
+            parent_id = f"{fname}_p{parent_idx}"
+            parent_map[parent_id] = parent_text
 
-                for child_idx, child_text in enumerate(children):
-                    child_id = f"{parent_id}_c{child_idx}"
-                    child_docs.append(child_text)
-                    child_ids.append(child_id)
-                    child_metadatas.append({
-                        'source': fname,
-                        'parent_id': parent_id,
-                    })
+            for child_idx, child_text in enumerate(children):
+                child_id = f"{parent_id}_c{child_idx}"
+                child_docs.append(child_text)
+                child_ids.append(child_id)
+                child_metadatas.append({
+                    'source': fname,
+                    'parent_id': parent_id,
+                })
 
-            dense = model.encode(child_docs, return_dense=True, return_sparse=False)["dense_vecs"]
+        dense = model.encode(child_docs, return_dense=True, return_sparse=False)["dense_vecs"]
 
-            collection.add(
-                documents=child_docs,
-                embeddings=dense.tolist(),
-                ids=child_ids,
-                metadatas=child_metadatas,
-            )
-            logger.info("%s: %d parents, %d children", fname, len(families), len(child_docs))
+        collection.add(
+            documents=child_docs,
+            embeddings=dense.tolist(),
+            ids=child_ids,
+            metadatas=child_metadatas,
+        )
+        logger.info("%s: %d parents, %d children", fname, len(families), len(child_docs))
 
     # Сохраняем parent_map на диск (для загрузки при старте сервиса)
     os.makedirs(os.path.dirname(PARENT_MAP_FILE) or ".", exist_ok=True)
