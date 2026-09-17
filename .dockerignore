@@ -9,6 +9,7 @@
 chromadb/
 chroma_db/
 gpn-assistant/
+ollama/
 .env
 docs/
 *.md

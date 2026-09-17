@@ -4,10 +4,12 @@ import logging
 import math
 import os
 import sys
+import threading
 
 import chromadb
 
-from core import weighted_rrf_fusion, OkapiBM25, estimate_top_k
+import config
+from core import score_postings, weighted_rrf_fusion, OkapiBM25, estimate_top_k
 from tracing import create_span
 
 logger = logging.getLogger(__name__)
@@ -23,14 +25,24 @@ logger = logging.getLogger(__name__)
 
 DENSE_DIM = 1024  # размерность dense-эмбеддингов BGE-M3
 # Файл параметров лежит внутри тома ./chromadb: переживает рестарт контейнера.
-TUNING_FILE = os.path.join("chromadb", "retrieval_tuning.json")
-PARENT_MAP_FILE = os.path.join("chromadb", "parent_map.json")
+TUNING_FILE = os.path.join(config.CHROMADB_DIR, "retrieval_tuning.json")
+PARENT_MAP_FILE = os.path.join(config.CHROMADB_DIR, "parent_map.json")
+# Кэш лексических весов BGE-M3 (sparse-канал): не переэнкодим корпус при каждом старте.
+SPARSE_CACHE_FILE = os.path.join(config.CHROMADB_DIR, "sparse_index.json")
+
+# Глобальные блокировки потокобезопасности:
+# - _INIT_LOCK защищает ленивую инициализацию моделей (двойная проверка),
+# - _INFER_SEM ограничивает число одновременных тяжёлых вызовов (энкод/реранк) на CPU,
+# - _CACHE_LOCK защищает разделяемый кэш результатов поиска (batch_search ↔ /chat).
+_INIT_LOCK = threading.Lock()
+_INFER_SEM = threading.Semaphore(config.SEARCH_CONCURRENCY)
+_CACHE_LOCK = threading.Lock()
 
 # Расширения документов базы знаний. Единый список для ingest, fingerprint и кэша.
 _KNOWLEDGE_EXT = {".txt", ".pdf"}
 
 
-def _knowledge_files(data_dir: str = "data") -> list[str]:
+def _knowledge_files(data_dir: str = config.DATA_DIR) -> list[str]:
     """Отсортированный список файлов базы знаний (txt/pdf) в data/."""
     if not os.path.isdir(data_dir):
         return []
@@ -75,8 +87,10 @@ def get_bge_m3():
     """BGE-M3 (dense + sparse + multi) — ленивая загрузка, один экземпляр."""
     global _bge_m3
     if _bge_m3 is None:
-        from FlagEmbedding import BGEM3FlagModel
-        _bge_m3 = BGEM3FlagModel("BAAI/bge-m3", use_fp16=False)
+        with _INIT_LOCK:
+            if _bge_m3 is None:
+                from FlagEmbedding import BGEM3FlagModel
+                _bge_m3 = BGEM3FlagModel("BAAI/bge-m3", use_fp16=False)
     return _bge_m3
 
 
@@ -84,8 +98,10 @@ def get_reranker():
     """Кросс-энкодер для реранкинга — ленивая загрузка, один экземпляр."""
     global _reranker
     if _reranker is None:
-        from sentence_transformers import CrossEncoder
-        _reranker = CrossEncoder("BAAI/bge-reranker-v2-m3")
+        with _INIT_LOCK:
+            if _reranker is None:
+                from sentence_transformers import CrossEncoder
+                _reranker = CrossEncoder("BAAI/bge-reranker-v2-m3")
     return _reranker
 
 
@@ -95,11 +111,46 @@ def store_ready() -> bool:
     return _collection is not None and _doc_sparse is not None
 
 
+def _docs_fingerprint(docs: list) -> str:
+    """Хеш содержимого документов коллекции — ключ кэша sparse-индекса."""
+    h = hashlib.sha256()
+    for doc in docs:
+        h.update(doc.encode("utf-8", errors="ignore"))
+    return h.hexdigest()
+
+
+def _load_sparse_cache(fp: str, ids: list) -> dict | None:
+    """Читает инвертированный sparse-индекс с диска, если корпус не менялся."""
+    if not os.path.exists(SPARSE_CACHE_FILE):
+        return None
+    try:
+        with open(SPARSE_CACHE_FILE, "r", encoding="utf-8") as f:
+            cached = json.load(f)
+        if cached.get("fingerprint") == fp and cached.get("ids") == ids:
+            inverted = {}
+            for doc_idx, weights in enumerate(cached["doc_weights"]):
+                for tok, w in weights.items():
+                    inverted.setdefault(tok, []).append((doc_idx, w))
+            return inverted
+    except Exception as e:
+        logger.warning("Sparse-кэш не читается (%s) — перестрою с нуля", e)
+    return None
+
+
+def _save_sparse_cache(fp: str, ids: list, doc_lexical: list) -> None:
+    os.makedirs(os.path.dirname(SPARSE_CACHE_FILE) or ".", exist_ok=True)
+    cache = {"fingerprint": fp, "ids": ids, "doc_weights": doc_lexical}
+    tmp = SPARSE_CACHE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False)
+    os.replace(tmp, SPARSE_CACHE_FILE)
+
+
 def reload_store() -> None:
     """Перечитывает коллекцию из ChromaDB и строит sparse/BM25-индексы заново."""
     global _client, _collection, _doc_ids, _docs, _doc_sparse, _bm25
     if _client is None:
-        _client = chromadb.PersistentClient(path="./chromadb")
+        _client = chromadb.PersistentClient(path=config.CHROMADB_DIR)
     try:
         _collection = _client.get_collection("kbase")
     except Exception:
@@ -134,12 +185,20 @@ def reload_store() -> None:
 
     # Sparse-индекс: лексические веса BGE-M3 всех документов → инвертированный
     # (токен → [(индекс_документа, вес)]). Так скоринг обходит только постинг-листы
-    # токенов запроса, а не весь корпус.
-    out = get_bge_m3().encode(_docs, return_dense=False, return_sparse=True)
-    inverted = {}
-    for doc_idx, weights in enumerate(out["lexical_weights"]):
-        for tok, w in weights.items():
-            inverted.setdefault(tok, []).append((doc_idx, w))
+    # токенов запроса, а не весь корпус. Переэнкод корпуса — только при смене
+    # документов (кэш лежит в ./chromadb и переживает рестарт контейнера).
+    fp = _docs_fingerprint(_docs)
+    inverted = _load_sparse_cache(fp, _doc_ids)
+    if inverted is None:
+        out = get_bge_m3().encode(_docs, return_dense=False, return_sparse=True)
+        inverted = {}
+        for doc_idx, weights in enumerate(out["lexical_weights"]):
+            for tok, w in weights.items():
+                inverted.setdefault(tok, []).append((doc_idx, w))
+        _save_sparse_cache(fp, _doc_ids, out["lexical_weights"])
+        logger.info("Sparse-индекс построен заново и кэширован в %s", SPARSE_CACHE_FILE)
+    else:
+        logger.info("Sparse-индекс загружен из кэша %s", SPARSE_CACHE_FILE)
     _doc_sparse = inverted
 
     # Третий канал: Okapi BM25 по леммам. Тяжёлых зависимостей нет; если что-то
@@ -197,13 +256,14 @@ def _sparse_scores(query_weights: dict, inverted_index: dict, n_docs: int) -> li
     """SPLADE-подобный скоринг по инвертированному индексу.
 
     Сумма произведений весов по пересечению токенов запроса с постинг-листами.
-    Идентично прежней формуле по всему корпусу, но обходит лишь релевантные документы.
+    Использует общий движок `core.score_postings` (тот же, что гоняет BM25-канал).
     """
-    scores = [0.0] * n_docs
-    for tok, qw in query_weights.items():
-        for doc_idx, w in inverted_index.get(tok, ()):
-            scores[doc_idx] += qw * w
-    return scores
+    return score_postings(
+        inverted_index,
+        n_docs,
+        query_weights.keys(),
+        lambda tok, doc_idx, w: query_weights[tok] * w,
+    )
 
 
 def _state_mark() -> tuple:
@@ -227,6 +287,8 @@ def _state_mark() -> tuple:
 
 
 def _cache_put(key: tuple, result: list) -> None:
+    # Вызывается только под _CACHE_LOCK (см. hybrid_search) — разделяемый кэш
+    # могут одновременно читать/писать потоки batch_search и /chat.
     if key in _SEARCH_CACHE:
         return
     _SEARCH_CACHE[key] = result
@@ -337,13 +399,18 @@ def hybrid_search(query: str, top_k: int | None = None, use_reranker: bool = Tru
         top_k = estimate_top_k(query)
 
     key = (query, top_k, use_reranker, _state_mark())
-    cached = _SEARCH_CACHE.get(key)
+    with _CACHE_LOCK:
+        cached = _SEARCH_CACHE.get(key)
     if cached is not None:
         return cached
 
-    result = _do_search(query, top_k, use_reranker, trace=trace)
+    # Тяжёлая часть (энкод BGE-M3 + ChromaDB + реранкер) — под семафором, чтобы
+    # параллельные запросы не устроили «гонку за CPU» (см. SEARCH_CONCURRENCY).
+    with _INFER_SEM:
+        result = _do_search(query, top_k, use_reranker, trace=trace)
     if result:  # пустые (например, во время инициализации) не кэшируем
-        _cache_put(key, result)
+        with _CACHE_LOCK:
+            _cache_put(key, result)
     return result
 
 
@@ -353,34 +420,19 @@ def semantic_sources(query, top_k=None):
     _ensure_store()
     if not store_ready():
         return []
-    model = get_bge_m3()
-    q_dense = model.encode([query], return_dense=True, return_sparse=False)["dense_vecs"][0]
-    res = _collection.query(
-        query_embeddings=[q_dense.tolist()],
-        n_results=top_k,
-        include=["metadatas"],
-    )
+    with _INFER_SEM:
+        model = get_bge_m3()
+        q_dense = model.encode([query], return_dense=True, return_sparse=False)["dense_vecs"][0]
+        res = _collection.query(
+            query_embeddings=[q_dense.tolist()],
+            n_results=top_k,
+            include=["metadatas"],
+        )
     return [m["source"] for m in res["metadatas"][0]]
 
 
 def hybrid_sources(query, top_k=None, use_reranker=True):
     return [src for _, src in hybrid_search(query, top_k=top_k, use_reranker=use_reranker)]
-
-
-def calculate_mrr(questions: list[tuple[str, str]], top_k: int = 3) -> tuple[float, float]:
-    sem_mrr_sum = 0.0
-    hyb_mrr_sum = 0.0
-    for q, expected in questions:
-        sem_sources_list = semantic_sources(q, top_k=top_k)
-        hyb_sources_list = hybrid_sources(q, top_k=top_k)
-        if expected in sem_sources_list:
-            rank = sem_sources_list.index(expected) + 1
-            sem_mrr_sum += 1.0 / rank
-        if expected in hyb_sources_list:
-            rank = hyb_sources_list.index(expected) + 1
-            hyb_mrr_sum += 1.0 / rank
-    n = len(questions)
-    return sem_mrr_sum / n, hyb_mrr_sum / n
 
 
 # --- ПАРАМЕТРЫ RETRIEVAL И АВТО-ПОДБОР ---
@@ -575,6 +627,7 @@ def auto_tune_if_data_changed(data_dir: str = "data") -> bool:
 if __name__ == "__main__":
     import argparse
 
+    config.init_console_utf8()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",

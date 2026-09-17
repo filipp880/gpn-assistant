@@ -1,14 +1,36 @@
-chromadb
-FlagEmbedding
-sentence-transformers
-ollama
-pymorphy3
+# CPU-only torch from official PyTorch index (~250MB instead of ~2.6GB CUDA build).
+# Only torch==2.13.0+cpu is taken from here, everything else stays on PyPI.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# --- ML / retrieval ---
+FlagEmbedding==1.4.2
+sentence-transformers==5.6.1
+transformers==5.14.1
+torch==2.13.0+cpu
+chromadb==1.5.9
+sentencepiece==0.2.2
+accelerate==1.15.0
+peft==0.21.0
+datasets==5.0.1
+ir-datasets==0.6.3
+
+# --- Russian language / lemmatization ---
+pymorphy3==2.0.6
 rapidfuzz==3.9.0
-fastapi
-uvicorn
-httpx
-python-multipart
-langfuse
-redis
-pytest
-pypdf
+
+# --- LLM (Ollama) ---
+ollama==0.6.2
+httpx==0.28.1
+
+# --- API (FastAPI) ---
+fastapi==0.141.1
+uvicorn==0.53.0
+python-multipart==0.0.32
+pypdf==6.19.0
+
+# --- Infrastructure ---
+langfuse==4.15.4
+redis==8.1.0
+
+# --- Tests ---
+pytest==9.1.1

@@ -7,6 +7,7 @@
 import math
 import re
 from collections import Counter
+from typing import Callable, Iterable
 
 import pymorphy3
 from rapidfuzz import process, fuzz
@@ -78,16 +79,16 @@ _HOMOGLYPH = {
 }
 _HOMOGLYPH_TABLE = str.maketrans(_HOMOGLYPH)
 
-
-def chunk_with_overlap(text: str, chunk_size: int = 500, overlap: int = 150) -> list[str]:
-    """Разбивает текст на чанки фиксированного размера с перекрытием."""
-    step = chunk_size - overlap
-    chunks = []
-    for i in range(0, len(text), step):
-        chunk = text[i : i + chunk_size].strip()
-        if chunk:
-            chunks.append(chunk)
-    return chunks
+# Частотные русские служебные слова — засоряют лексический канал (BM25):
+# они есть почти в каждом документе и почти не несут смысла. Исключаются
+# только из BM25-индекса; tokenize_lemmas (сленг/обратная карта) не трогаем.
+_RU_STOPWORDS = frozenset({
+    "и", "в", "во", "на", "не", "что", "с", "со", "к", "а", "но", "по",
+    "для", "от", "это", "за", "о", "об", "из", "при", "или", "также",
+    "уже", "все", "есть", "если", "то", "у", "только", "до", "же", "бы",
+    "как", "он", "она", "они", "мы", "вы", "ты", "я", "под", "над", "без",
+    "ни", "да",
+})
 
 
 def adaptive_chunk(text: str, max_chunk: int = 500) -> list[str]:
@@ -97,7 +98,7 @@ def adaptive_chunk(text: str, max_chunk: int = 500) -> list[str]:
     разрыв. Предложения длиннее max_chunk режутся жёстко.
 
     Заголовки разделов (markdown `## ...` или короткая строка-название, стоящая
-    своим абзацем) не теряются: заголовок приклеивается к первому чанку своего
+    своим абзацем) не теряются: заголовок приклеивается к каждому чанку своего
     раздела, так что dense-поиск и реранкер видят контекст раздела целиком.
     """
     chunks = []
@@ -159,7 +160,7 @@ def parent_child_chunk(
     result = []
     for parent_text in raw_parents:
         if len(parent_text) <= child_size:
-            # Parent足够小 — он сам является единственным child
+            # Parent достаточно мал — он сам является единственным child
             result.append((parent_text, [parent_text]))
             continue
 
@@ -206,6 +207,29 @@ def tokenize_lemmas(text: str) -> list[str]:
     return [_morph.normal_forms(w)[0] for w in words]
 
 
+def score_postings(
+    postings: dict[str, list[tuple[int, float]]],
+    n_docs: int,
+    query_terms: Iterable[str],
+    term_score: Callable[[str, int, float], float],
+) -> list[float]:
+    """Скоринг документов по инвертированному индексу (общий движок).
+
+    Обходит только постинг-листы токенов запроса, а не весь корпус, и накапливает
+    вклад term_score(токен, индекс_документа, вес) по каждому документу. Документы
+    без токенов запроса остаются с нулевым скором — результат идентичен полному
+    перебору корпуса.
+
+    Общий для лексических каналов: OkapiBM25 (леммы, точная словоформа) и sparse-канал
+    BGE-M3 (SPLADE-произведение весов) — отличаются только формулой term_score.
+    """
+    scores = [0.0] * n_docs
+    for tok in query_terms:
+        for doc_idx, weight in postings.get(tok, ()):
+            scores[doc_idx] += term_score(tok, doc_idx, weight)
+    return scores
+
+
 class OkapiBM25:
     """Okapi BM25 на лемматизированных токенах (pymorphy3).
 
@@ -226,12 +250,14 @@ class OkapiBM25:
         total_len = 0
         for doc_idx, doc in enumerate(corpus):
             tf = Counter(tokenize_lemmas(doc))
-            dl = sum(tf.values())
+            dl = sum(v for t, v in tf.items() if t not in _RU_STOPWORDS)
             self.doc_len.append(dl)
             total_len += dl
             for term, f in tf.items():
+                if term in _RU_STOPWORDS:
+                    continue
                 self.postings.setdefault(term, []).append((doc_idx, f))
-            df.update(tf.keys())
+                df.update([term])
         self.avgdl = total_len / self.N if self.N else 0.0
         self.idf = {
             t: math.log(1 + (self.N - n + 0.5) / (n + 0.5))
@@ -241,34 +267,24 @@ class OkapiBM25:
     def get_scores(self, query: str) -> list[float]:
         """Скоринг документов под запрос (леммы) по инвертированному индексу.
 
-        Результат идентичен полному перебору корпуса: документы без токенов
-        запроса дают вклад 0 и остаются с нулевым скором.
+        Обходится через общий движок `score_postings`: только постинг-листы
+        токенов запроса, документы без совпадений остаются с нулевым скором.
         """
-        out = [0.0] * self.N
-        q = set(tokenize_lemmas(query))
+        if self.N == 0:
+            return []
+        q = {t for t in tokenize_lemmas(query) if t not in _RU_STOPWORDS}
         norm_cache: dict[int, float] = {}
-        for t in q:
-            idf = self.idf.get(t)
-            if idf is None:
-                continue
-            for doc_idx, f in self.postings.get(t, ()):
-                norm = norm_cache.get(doc_idx)
-                if norm is None:
-                    dl = self.doc_len[doc_idx]
-                    norm = dl / self.avgdl if self.avgdl else 0.0
-                    norm_cache[doc_idx] = norm
-                denom = f + self.k1 * (1 - self.b + self.b * norm)
-                out[doc_idx] += idf * (f * (self.k1 + 1)) / denom
-        return out
 
+        def bm25(tok: str, doc_idx: int, f: float) -> float:
+            norm = norm_cache.get(doc_idx)
+            if norm is None:
+                dl = self.doc_len[doc_idx]
+                norm = dl / self.avgdl if self.avgdl else 0.0
+                norm_cache[doc_idx] = norm
+            denom = f + self.k1 * (1 - self.b + self.b * norm)
+            return self.idf.get(tok, 0.0) * (f * (self.k1 + 1)) / denom
 
-def rrf_fusion(rankings: list[list[str]], k: int = 60, top_k: int = 5) -> list[str]:
-    """Reciprocal Rank Fusion: объединение списков ранжированных документов."""
-    scores = {}
-    for ranking in rankings:
-        for rank, doc_id in enumerate(ranking, start=1):
-            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank)
-    return sorted(scores, key=scores.get, reverse=True)[:top_k]
+        return score_postings(self.postings, self.N, q, bm25)
 
 
 def weighted_rrf_fusion(
@@ -349,7 +365,7 @@ def resolve_slang_terms(query: str, dictionary: dict, threshold: int = 80) -> tu
         if score > thr and original_key != raw:
             canonical = dictionary[original_key]
             resolved_terms.append({
-                "original": token,
+                "original": raw,
                 "canonical": canonical,
                 "score": float(score)
             })

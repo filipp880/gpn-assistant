@@ -1,6 +1,13 @@
 services:
   ollama:
-    image: ollama/ollama:latest
+    # Модель запечена в образ (см. ollama/Dockerfile): первое поднятие не качает ~4-5 ГБ.
+    # Можно собрать один раз, запушить в registry и задать OLLAMA_IMAGE — тогда все
+    # поднимут стек без какого-либо скачивания модели.
+    image: ${OLLAMA_IMAGE:-gpn-ollama:latest}
+    build:
+      context: ./ollama
+      args:
+        LLM_MODEL: ${LLM_MODEL:-gemma4:e2b-it-qat}
     ports:
       - "11434:11434"
     volumes:
@@ -14,7 +21,7 @@ services:
       timeout: 5s
       retries: 60
       start_period: 20s
-    entrypoint: ["/bin/sh", "-c", "ollama serve & sleep 10 && ollama pull $${LLM_MODEL} && wait"]
+    entrypoint: ["/bin/sh", "-c", "ollama serve & for i in $(seq 1 30); do ollama show $${LLM_MODEL} >/dev/null 2>&1 && break; sleep 1; done; ollama show $${LLM_MODEL} >/dev/null 2>&1 || ollama pull $${LLM_MODEL}; wait"]
 
   langfuse-db:
     image: postgres:15-alpine
@@ -56,6 +63,14 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      # python:slim не содержит curl — проверяем через urllib. wARMUP ушёл в фон,
+      # поэтому /health отвечает 200 (degraded) сразу после старта uvicorn.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
     environment:
       - OLLAMA_HOST=http://ollama:11434
       - LLM_MODEL=${LLM_MODEL:-gemma4:e2b-it-qat}

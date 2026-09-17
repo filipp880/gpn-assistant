@@ -4,10 +4,11 @@ import os
 import chromadb
 from core import parent_child_chunk
 from retrieval import get_bge_m3, auto_tune_if_data_changed, DENSE_DIM, _data_fingerprint, _knowledge_files
+import config
 
 logger = logging.getLogger(__name__)
 
-PARENT_MAP_FILE = os.path.join("chromadb", "parent_map.json")
+PARENT_MAP_FILE = os.path.join(config.CHROMADB_DIR, "parent_map.json")
 
 
 def _read_document(path: str, name: str) -> str:
@@ -22,28 +23,19 @@ def _read_document(path: str, name: str) -> str:
 
 
 def main():
+    config.init_console_utf8()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     if hasattr(chromadb, "PersistentClient"):
-        client = chromadb.PersistentClient(path="./chromadb")
+        client = chromadb.PersistentClient(path=config.CHROMADB_DIR)
     elif hasattr(chromadb, "Client"):
         client = chromadb.Client()
     else:
         raise ImportError("Не удалось инициализировать ChromaDB. Проверьте отсутствие файла chromadb.py в директории.")
 
-    try:
-        client.delete_collection('kbase')
-    except Exception:
-        pass
-
-    collection = client.create_collection(
-        name='kbase',
-        metadata={"hnsw:space": "cosine"}
-    )
-
-    data_dir = 'data'
+    data_dir = config.DATA_DIR
     if not os.path.isdir(data_dir):
         logger.warning("Не найдена директория data/ — база знаний не построена.")
         return
@@ -51,8 +43,9 @@ def main():
     fingerprint = _data_fingerprint(data_dir)
 
     # --- Инкрементальный ingest ---
-    # Если документы не менялись, база совместима по размерности и parent_map на
-    # месте — пересобирать нечего: старт контейнера не тратит время на ре-энкод.
+    # Проверяем существующую коллекцию ДО delete/create: раньше они шли раньше
+    # проверки, и та всегда видела пустую свежесозданную коллекцию без
+    # fingerprint — каждый старт контейнера пересобирал индекс и гонял auto_tune.
     try:
         existing = client.get_collection('kbase')
     except Exception:

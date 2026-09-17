@@ -1,10 +1,8 @@
 import pytest
 
 from core import (
-    chunk_with_overlap,
     adaptive_chunk,
     tokenize_lemmas,
-    rrf_fusion,
     weighted_rrf_fusion,
     normalize_token,
     resolve_slang_terms,
@@ -21,21 +19,6 @@ DICT = {
 }
 
 
-# --- chunk_with_overlap ---
-def test_chunk_with_overlap_sizes():
-    text = "а" * 1000
-    chunks = chunk_with_overlap(text, chunk_size=500, overlap=150)
-    assert chunks
-    assert all(len(c) <= 500 for c in chunks)
-    # 1000 символов при шаге 350 даёт ceil(1000/350)=3 чанка
-    assert len(chunks) == 3
-
-
-def test_chunk_with_overlap_empty():
-    assert chunk_with_overlap("") == []
-    assert chunk_with_overlap("   ") == []
-
-
 # --- tokenize_lemmas ---
 def test_tokenize_lemmas_basic():
     assert tokenize_lemmas("скважины")[0] == "скважина"
@@ -45,25 +28,11 @@ def test_tokenize_lemmas_regex():
     assert "нефть" in tokenize_lemmas("нефтяной; НЕФТЬ;")
 
 
-# --- rrf_fusion ---
-def test_rrf_fusion_common_first():
-    fused = rrf_fusion([["a", "b", "c"], ["a", "c", "b"]], top_k=2)
-    assert fused[0] == "a"
-
-
-def test_rrf_fusion_top_k():
-    fused = rrf_fusion([["a", "b", "c"]], top_k=3)
-    assert len(fused) == 3
-
-
-def test_rrf_fusion_empty():
-    assert rrf_fusion([]) == []
-
-
 # --- weighted_rrf_fusion ---
-def test_weighted_rrf_equal_weights_match_rrf():
+def test_weighted_rrf_equal_weights():
     rankings = [["a", "b", "c"], ["a", "c", "b"]]
-    assert weighted_rrf_fusion(rankings, [1.0, 1.0], top_k=2) == rrf_fusion(rankings, top_k=2)
+    fused = weighted_rrf_fusion(rankings, [1.0, 1.0], top_k=2)
+    assert fused[0] == "a"
 
 
 def test_weighted_rrf_high_weight_dominates():
@@ -158,6 +127,20 @@ def test_bm25_lemma_form_in_search():
 def test_bm25_empty_corpus():
     bm25 = OkapiBM25([])
     assert bm25.get_scores("любой запрос") == []
+
+
+def test_bm25_stopwords_ignored():
+    # Запрос из одних стоп-слов не должен ничего ранжировать
+    corpus = [
+        "Внедряется машинное обучение для цифровизации.",
+        "Летом на море тепло и солнечно, рыбы много.",
+    ]
+    bm25 = OkapiBM25(corpus)
+    assert bm25.get_scores("и на в") == [0.0, 0.0]
+    # Смысловое слово пробивает стоп-слова, а не «для»/«и»
+    scores = bm25.get_scores("и машинное для")
+    assert scores[0] > 0.0 and scores[1] == 0.0
+    assert scores[0] > scores[1]
 
 
 # --- normalize_token ---

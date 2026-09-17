@@ -1,6 +1,7 @@
-import os
 import json
+import os
 import re
+import threading
 import time
 import ollama
 import logging
@@ -8,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from retrieval import hybrid_search
 from core import resolve_slang_terms
 from tracing import create_span
+import config
 
 # Настройка логирования для Docker-контейнера
 logger = logging.getLogger(__name__)
@@ -19,7 +21,7 @@ class OllamaUnavailableError(Exception):
 
 
 # Путь к словарю — единый источник истины для чтения и записи.
-DICTIONARY_FILE = "corporate_dictionary.json"
+DICTIONARY_FILE = config.DICTIONARY_FILE
 
 
 def save_dictionary(dictionary: dict) -> None:
@@ -30,11 +32,11 @@ def save_dictionary(dictionary: dict) -> None:
 
 class GpnAgent:
     # Ограничение хакатона: контекстное окно модели — не более 32 000 токенов.
-    LLM_MAX_CONTEXT = 32000
+    LLM_MAX_CONTEXT = config.LLM_MAX_CONTEXT
 
     def __init__(self):
-        self.model_name = os.getenv("LLM_MODEL", "gemma4:e2b-it-qat")
-        self.num_ctx = int(os.getenv("LLM_NUM_CTX", "8192"))
+        self.model_name = config.LLM_MODEL
+        self.num_ctx = config.LLM_NUM_CTX
         if self.num_ctx > self.LLM_MAX_CONTEXT:
             logger.warning(
                 "LLM_NUM_CTX=%d превышает лимит хакатона (%d) — ограничиваю до %d",
@@ -43,11 +45,10 @@ class GpnAgent:
             self.num_ctx = self.LLM_MAX_CONTEXT
         elif self.num_ctx < 1024:
             self.num_ctx = 8192
-        self.max_iterations = int(os.getenv("AGENT_MAX_ITERATIONS", "3"))
-        self.self_check = os.getenv("LLM_SELF_CHECK", "0").lower() in ("1", "true", "yes", "on")
+        self.max_iterations = config.AGENT_MAX_ITERATIONS
+        self.self_check = config.LLM_SELF_CHECK
         self.dictionary = self._load_dictionary()
-        host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-        self._client = ollama.Client(host=host, timeout=120)
+        self._client = ollama.Client(host=config.OLLAMA_HOST, timeout=120)
         logger.info(
             f"GpnAgent инициализирован. Словарь загружен. Модель: {self.model_name} "
             f"(num_ctx={self.num_ctx}, self_check={self.self_check})"
@@ -72,19 +73,19 @@ class GpnAgent:
             "ГДИС": "Гидродинамическое исследование скважин"
         }
 
-    def _chat(self, messages, tools=None, options=None, **kwargs):
+    def _chat(self, messages, options=None, **kwargs):
         """chat() с ретраями на транзиентные ошибки Ollama.
 
         На слабых машинах модель иногда догружается/отвечает сетевыми сбоями —
         повтор пробует счастливый путь, а не падает сразу. Переполнение контекста
         ретраить бессмысленно, поэтому оно пробрасывается как есть.
         """
-        attempts = int(os.getenv("OLLAMA_MAX_RETRIES", "3"))
+        attempts = config.OLLAMA_MAX_RETRIES
         for attempt in range(attempts):
             try:
                 return self._client.chat(
                     model=self.model_name, messages=messages,
-                    tools=tools, options=options, **kwargs,
+                    options=options, **kwargs,
                 )
             except Exception as e:
                 if "longer than context length" in str(e).lower():
@@ -156,6 +157,10 @@ class GpnAgent:
 
                 # Ограничиваем до 3 подзапросов
                 sub_queries = [str(q).strip() for q in sub_queries[:3] if q]
+                if not sub_queries:
+                    logger.warning("Decomposition: подзапросы пустые, fallback на оригинальный запрос")
+                    span.update(output={"sub_queries": [user_query], "note": "empty_after_filter"})
+                    return [user_query]
                 logger.info("Decomposition: '%s' → %d подзапросов", user_query, len(sub_queries))
                 span.update(output={"sub_queries": sub_queries, "count": len(sub_queries)})
                 return sub_queries
@@ -165,8 +170,11 @@ class GpnAgent:
                 span.update(output={"sub_queries": [user_query], "error": str(e)})
                 return [user_query]
 
-    def _search_single(self, query: str, trace=None) -> dict:
-        """Один поиск с resolve_slang + hybrid_search. Для использования в потоках."""
+    def _search_impl(self, query: str, trace=None) -> dict:
+        """Общая реализация поиска: resolve_slang + hybrid_search + сборка контекста.
+
+        Единая точка поиска: вызывается из `_search_single` (и из потоков `_search_batch`).
+        """
         expanded, search_terms = self._resolve_slang(query)
         results = hybrid_search(expanded, trace=trace)
         context_parts = []
@@ -182,11 +190,17 @@ class GpnAgent:
             "results_count": len(results),
         }
 
+    def _search_single(self, query: str, trace=None) -> dict:
+        """Один поиск с resolve_slang + hybrid_search. Для использования в потоках."""
+        return self._search_impl(query, trace=trace)
+
     def _search_batch(self, sub_queries: list[str], trace=None) -> list[dict]:
         """Параллельный поиск по списку подзапросов через ThreadPoolExecutor.
 
         Возвращает список результатов (по одному на подзапрос).
         """
+        if not sub_queries:
+            return []
         if len(sub_queries) == 1:
             return [self._search_single(sub_queries[0], trace=trace)]
 
@@ -221,36 +235,6 @@ class GpnAgent:
             })
             return results
 
-    # --- ИНСТРУМЕНТЫ (TOOLS) ---
-    def _search_article(self, query: str, trace=None) -> dict:
-        """Поиск по базе знаний с предварительным fuzzy-матчингом"""
-        with create_span(trace, "search_article", {"query": query}, input_data=query) as span:
-            expanded_query, search_terms = self._resolve_slang(query)
-            
-            # Вызов твоего гибридного поиска
-            results = hybrid_search(expanded_query, trace=trace) 
-            
-            context_parts = []
-            sources = set()
-            
-            for doc, src in results:
-                context_parts.append(f"[источник: {src}]\n{doc}")
-                sources.add(src)
-            
-            result = {
-                "context": "\n\n".join(context_parts),
-                "sources": list(sources),
-                "resolved_in_search": search_terms
-            }
-            span.update(output={"sources": list(sources), "results_count": len(results), "resolved_terms": len(search_terms)})
-            return result
-
-    def _dispatch(self, function_name: str, arguments: dict, trace=None) -> dict:
-        if function_name == 'search_article':
-            return self._search_article(**arguments, trace=trace)
-        else:
-            raise ValueError(f"Неизвестный инструмент: {function_name}")
-
     # --- ГЛАВНЫЙ ЦИКЛ АГЕНТА ---
     def process_query(self, user_query: str, history: list, trace=None) -> dict:
         # 1. Pre-processing: resolve slang
@@ -261,7 +245,7 @@ class GpnAgent:
         # 2. Query Decomposition → parallel search → synthesis
         with create_span(trace, "rag_pipeline", {"query": user_query}) as pipeline_span:
             result = self._rag_decomposition_pipeline(
-                user_query, expanded_user_query, initial_resolved_terms, trace=trace
+                user_query, expanded_user_query, initial_resolved_terms, history, trace=trace
             )
             pipeline_span.update(output={
                 "sources": result["sources"],
@@ -272,7 +256,7 @@ class GpnAgent:
 
     def _rag_decomposition_pipeline(
         self, user_query: str, expanded_query: str,
-        initial_resolved_terms: list, trace=None,
+        initial_resolved_terms: list, history: list, trace=None,
     ) -> dict:
         """Query Decomposition → parallel search → LLM synthesis."""
 
@@ -326,7 +310,7 @@ class GpnAgent:
             {'role': 'system', 'content': system_prompt},
         ]
         # Add history
-        messages.extend(history[-int(os.getenv("MAX_HISTORY_TURNS", "6")):])
+        messages.extend(history[-config.MAX_HISTORY_TURNS:])
 
         # User message with context
         if combined_context:
@@ -420,9 +404,26 @@ class GpnAgent:
             return True
 
 # --- СИНГЛТОН ДЛЯ FASTAPI ---
-# Экземпляр создается один раз при импорте модуля
-agent_instance = GpnAgent()
+# Экземпляр создаётся лениво при первом обращении, а не на импорте модуля:
+# import agent сам по себе не создаёт словарь и клиент Ollama.
+_agent = None
+_agent_lock = threading.Lock()
+
+
+def get_agent() -> GpnAgent:
+    """Ленивый синглтон: создаёт GpnAgent при первом обращении.
+
+    Создание под lock'ом: два параллельных первых запроса не должны поднять
+    два экземпляра (каждый тянет словарь и клиент Ollama).
+    """
+    global _agent
+    if _agent is None:
+        with _agent_lock:
+            if _agent is None:
+                _agent = GpnAgent()
+    return _agent
+
 
 def run_my_agent_logic(query: str, session_id: str, history: list, trace=None) -> dict:
     """Точка входа, которую вызывает app.py (FastAPI)"""
-    return agent_instance.process_query(query, history, trace=trace)
+    return get_agent().process_query(query, history, trace=trace)
