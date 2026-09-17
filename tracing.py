@@ -128,18 +128,6 @@ def create_span(trace_or_parent, name: str, metadata: dict | None = None, input_
         span.update(metadata={**current_meta, "latency_ms": round(elapsed_ms, 1)})
 
 
-def score(trace, name: str, value: float, comment: str | None = None):
-    """Логирует числовую метрику (latency, score, etc.) к трейсу."""
-    lf = get_langfuse()
-    if lf and trace:
-        lf.score(
-            trace_id=trace.id,
-            name=name,
-            value=value,
-            comment=comment,
-        )
-
-
 class _NoopTrace:
     """Заглушка: методы-бездейственники, чтобы код не проверял if trace."""
     id = None
