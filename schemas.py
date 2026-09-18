@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 
 
 class ChatRequest(BaseModel):
-    query: str = Field(..., description="Запрос пользователя", example="Какая EBITDA у ГПНР за 2025 год?")
+    query: str = Field(..., description="Запрос пользователя", json_schema_extra={"example": "Какая EBITDA у ГПНР за 2025 год?"})
     session_id: Optional[str] = Field(None, description="ID сессии для мульти-тернового диалога")
 
 
@@ -34,8 +34,8 @@ class HealthResponse(BaseModel):
 
 
 class DictionaryItem(BaseModel):
-    key: str = Field(..., description="Аббревиатура/термин", example="КРС")
-    value: str = Field(..., description="Расшифровка/значение", example="Капитальный ремонт скважин")
+    key: str = Field(..., description="Аббревиатура/термин", json_schema_extra={"example": "КРС"})
+    value: str = Field(..., description="Расшифровка/значение", json_schema_extra={"example": "Капитальный ремонт скважин"})
 
 
 class DictionaryResponse(BaseModel):
