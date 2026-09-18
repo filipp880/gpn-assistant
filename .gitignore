@@ -1,4 +1,11 @@
-venv/
+**/venv/
+**/.venv/
+.pip_cache/
+.pytest_cache/
+**/__pycache__/
+**/*.pyc
 chromadb/
-__pycache__/
+chroma_db/
+.vscode/
 history.json
+.env

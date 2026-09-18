@@ -10,6 +10,7 @@ import chromadb
 
 import config
 from core import score_postings, weighted_rrf_fusion, OkapiBM25, estimate_top_k
+from docs import SUPPORTED_EXT
 from tracing import create_span
 
 logger = logging.getLogger(__name__)
@@ -39,7 +40,7 @@ _INFER_SEM = threading.Semaphore(config.SEARCH_CONCURRENCY)
 _CACHE_LOCK = threading.Lock()
 
 # Расширения документов базы знаний. Единый список для ingest, fingerprint и кэша.
-_KNOWLEDGE_EXT = {".txt", ".pdf"}
+_KNOWLEDGE_EXT = SUPPORTED_EXT
 
 
 def _knowledge_files(data_dir: str = config.DATA_DIR) -> list[str]:

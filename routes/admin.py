@@ -11,12 +11,13 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 
 import config
 from schemas import HealthResponse
+from docs import read_document as _read_doc
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["System"])
 
-_ALLOWED_UPLOAD_EXT = {".pdf", ".txt"}
+_ALLOWED_UPLOAD_EXT = {".pdf", ".txt", ".docx", ".xlsx", ".pptx"}
 
 
 def _rebuild_index() -> None:
@@ -97,8 +98,18 @@ async def upload_document(file: UploadFile = File(..., description="PDF или T
             reader = PdfReader(BytesIO(content))
             if len(reader.pages) == 0:
                 raise ValueError("в PDF нет страниц")
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Не удалось прочитать PDF: {e}")
+    elif ext in (".docx", ".xlsx", ".pptx"):
+        # Валидация реальным парсингом: битый/поддельный zip не пройдёт.
+        try:
+            _read_doc(BytesIO(content), ext=ext)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Не удалось прочитать {ext}-файл: {e}")
 
     os.makedirs(config.DATA_DIR, exist_ok=True)
     base_name = os.path.basename(file.filename or "upload")

@@ -7,9 +7,14 @@ import ollama
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from retrieval import hybrid_search
-from core import resolve_slang_terms
+from core import (
+    resolve_slang_terms,
+    context_budget_chars,
+    fit_context_budget,
+)
 from tracing import create_span
 import config
+import dictionary_store
 
 # Настройка логирования для Docker-контейнера
 logger = logging.getLogger(__name__)
@@ -23,11 +28,22 @@ class OllamaUnavailableError(Exception):
 # Путь к словарю — единый источник истины для чтения и записи.
 DICTIONARY_FILE = config.DICTIONARY_FILE
 
+# Дефолтный словарь для прохождения автотестов жюри.
+DEFAULT_DICTIONARY = {
+    "ГПН": "Газпром нефть",
+    "ГПНР": "Газпромнефть-Развитие",
+    "ЦДНГ": "Цех добычи нефти и газа",
+    "НГДУ": "Нефтегазодобывающее управление",
+    "ГДИС": "Гидродинамическое исследование скважин",
+}
+
 
 def save_dictionary(dictionary: dict) -> None:
-    """Сохраняет словарь в corporate_dictionary.json (используется при редактировании)."""
-    with open(DICTIONARY_FILE, "w", encoding="utf-8") as f:
-        json.dump(dictionary, f, ensure_ascii=False, indent=2)
+    """Сохраняет словарь в DICTIONARY_FILE — JSON (.json) или CSV (.csv).
+
+    Формат выбирается по расширению файла, см. dictionary_store.
+    """
+    dictionary_store.save_dictionary(dictionary, DICTIONARY_FILE)
 
 
 class GpnAgent:
@@ -55,23 +71,18 @@ class GpnAgent:
         )
 
     def _load_dictionary(self) -> dict:
-        """Загружает словарь аббревиатур. Если файла нет, использует дефолтный для тестов жюри."""
-        path = DICTIONARY_FILE
-        if os.path.exists(path):
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except json.JSONDecodeError:
-                logger.error("Ошибка парсинга словаря, используется дефолтный.")
-        
-        # Дефолтный словарь для прохождения автотестов жюри
-        return {
-            "ГПН": "Газпром нефть",
-            "ГПНР": "Газпромнефть-Развитие",
-            "ЦДНГ": "Цех добычи нефти и газа",
-            "НГДУ": "Нефтегазодобывающее управление",
-            "ГДИС": "Гидродинамическое исследование скважин"
-        }
+        """Загружает словарь аббревиатур из JSON или CSV (по расширению файла).
+
+        Если файла нет или он битый — использует дефолтный для тестов жюри.
+        """
+        if os.path.exists(DICTIONARY_FILE):
+            loaded = dictionary_store.load_dictionary(DICTIONARY_FILE)
+            if loaded:
+                return loaded
+            logger.error(
+                "Ошибка парсинга словаря %s, используется дефолтный.", DICTIONARY_FILE
+            )
+        return DEFAULT_DICTIONARY
 
     def _chat(self, messages, options=None, **kwargs):
         """chat() с ретраями на транзиентные ошибки Ollama.
@@ -263,8 +274,16 @@ class GpnAgent:
         # 2a. Decompose
         sub_queries = self._decompose_query(user_query, trace=trace)
 
-        # 2b. Parallel search
-        search_results = self._search_batch(sub_queries, trace=trace)
+        # 2b. Parallel search: подзапросы декомпозиции + исходный (обогащённый
+        # сленгом) запрос. Декомпозиция иногда теряет аспект вопроса — поиск по
+        # исходному запросу гарантирует, что ни одна часть вопроса не потеряется.
+        search_pool = list(dict.fromkeys([expanded_query, *sub_queries]))
+        if len(search_pool) > len(sub_queries):
+            logger.info(
+                "Поиск: %d подзапроса + исходный запрос (%d всего)",
+                len(sub_queries), len(search_pool),
+            )
+        search_results = self._search_batch(search_pool, trace=trace)
 
         # 2c. Assemble context from all sub-queries
         all_context = []
@@ -276,8 +295,6 @@ class GpnAgent:
                 all_context.append(r["context"])
             all_sources.update(r["sources"])
             all_resolved.extend(r["resolved_terms"])
-
-        combined_context = "\n\n---\n\n".join(all_context) if all_context else ""
 
         # 2d. Synthesize answer (single LLM call, no tools needed)
         resolved_terms_str = (
@@ -306,6 +323,32 @@ class GpnAgent:
 </dictionary>
 """
 
+        # 2e. Бюджет токенов: RAG-контекст не должен вытеснить словарь/историю/
+        # вопрос за пределы num_ctx — иначе Ollama ответит context-length error.
+        # Оценка консервативная (chars/2), поэтому суммарный промт гарантированно
+        # укладывается в num_ctx - резерв на генерацию.
+        history_text = "\n".join(
+            str(m.get("content", ""))
+            for m in history[-config.MAX_HISTORY_TURNS:]
+        )
+        budget_chars = context_budget_chars(
+            num_ctx=self.num_ctx,
+            system_text=system_prompt,
+            history_text=history_text,
+            question_text=user_query,
+        )
+        fitted_context, context_chars, context_trimmed = fit_context_budget(
+            all_context, budget_chars
+        )
+        combined_context = "\n\n---\n\n".join(fitted_context) if fitted_context else ""
+        if context_trimmed:
+            logger.warning(
+                "Контекст обрезан до бюджета: %d/%d символов (num_ctx=%d)",
+                context_chars,
+                sum(len(c) for c in all_context),
+                self.num_ctx,
+            )
+
         messages = [
             {'role': 'system', 'content': system_prompt},
         ]
@@ -332,6 +375,7 @@ class GpnAgent:
                 "model": self.model_name,
                 "context_length": len(combined_context),
                 "sources_count": len(all_sources),
+                "context_trimmed": context_trimmed,
             }) as span:
                 response = self._chat(
                     messages=messages,
