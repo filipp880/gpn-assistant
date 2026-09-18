@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import os
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -109,3 +110,12 @@ app.include_router(chat.router)
 app.include_router(sessions.router)
 app.include_router(dictionary.router)
 app.include_router(admin.router)
+
+# --- Фронтенд (vanilla SPA) — раздаётся корнем ""; API-роуты выше приоритетнее ---
+from fastapi.staticfiles import StaticFiles
+
+FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "frontend")
+if os.path.isdir(FRONTEND_DIR):
+    app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
+else:
+    logger.warning("frontend/ не найден — UI не раздаётся, работает только API")

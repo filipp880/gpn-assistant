@@ -51,7 +51,7 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 LLM_MODEL = os.getenv("LLM_MODEL", "gemma4:e2b-it-qat")
 LLM_MAX_CONTEXT = 32000
 LLM_NUM_CTX = _env_int("LLM_NUM_CTX", 8192)
-LLM_SELF_CHECK = _env_flag("LLM_SELF_CHECK")
+LLM_SELF_CHECK = _env_flag("LLM_SELF_CHECK", default=True)
 MAX_HISTORY_TURNS = _env_int("MAX_HISTORY_TURNS", 6)
 OLLAMA_MAX_RETRIES = _env_int("OLLAMA_MAX_RETRIES", 3)
 AGENT_MAX_ITERATIONS = _env_int("AGENT_MAX_ITERATIONS", 3)

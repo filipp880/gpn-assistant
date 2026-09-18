@@ -307,6 +307,95 @@ def weighted_rrf_fusion(
     return sorted(scores, key=scores.get, reverse=True)[:top_k]
 
 
+# --- БЮДЖЕТ ТОКЕНОВ КОНТЕКСТА ДЛЯ СИНТЕЗА ---
+# Внутренняя оценка числа токенов: ~2 символа на токен. Для русского текста
+# реально ~1.7-2.5 символа на токен, для латинских вкраплений (EBITDA и т.п.) —
+# до 4. Без встроенного токенизатора берём верхнюю границу: переоценённые
+# токены → контекст гарантированно не вытеснит system-промт/словарь/историю
+# за пределы num_ctx (иначе Ollama уронит запрос с context-length error).
+CHARS_PER_TOKEN = 2
+
+
+def estimate_tokens(text: str) -> int:
+    """Консервативная (завышенная) оценка числа токенов в тексте."""
+    if not text:
+        return 0
+    return math.ceil(len(text) / CHARS_PER_TOKEN)
+
+
+# Запас токенов на генерацию ответа LLM (внутри того же окна num_ctx).
+GENERATION_TOKEN_RESERVE = 1024
+
+_SENT_END_RE = re.compile(r"[.!?…]\s+")
+
+
+def _cut_sentence(text: str, max_chars: int) -> str:
+    """Режет текст по границе предложения, не выходя за max_chars символов."""
+    if len(text) <= max_chars:
+        return text
+    slice_ = text[:max_chars]
+    matches = list(_SENT_END_RE.finditer(slice_))
+    if matches:
+        return slice_[: matches[-1].end()]
+    return slice_
+
+
+def fit_context_budget(
+    context_parts: list[str],
+    budget_chars: int,
+) -> tuple[list[str], int, bool]:
+    """Обрезает список контекстных фрагментов под бюджет символов.
+
+    Фрагменты считаются упорядоченными по убыванию важности (в агенте — от
+    запроса к подзапросам декомпозиции). Берём целые фрагменты, пока влезают;
+    последний умещающийся обрезается по границе предложения. Остальные после
+    точки обрезания отбрасываются.
+
+    Возвращает (подогнанный_список, суммарная_длина, был_ли_обрез).
+    """
+    used = 0
+    fitted: list[str] = []
+    trimmed = False
+    for part in context_parts:
+        if not part:
+            continue
+        if used + len(part) <= budget_chars:
+            fitted.append(part)
+            used += len(part)
+            continue
+        trimmed = True
+        if used < budget_chars:
+            cut = _cut_sentence(part, budget_chars - used)
+            if cut:
+                fitted.append(cut)
+                used += len(cut)
+        break
+    return fitted, used, trimmed
+
+
+def context_budget_chars(
+    num_ctx: int,
+    system_text: str,
+    history_text: str,
+    question_text: str,
+    reserve: int = GENERATION_TOKEN_RESERVE,
+) -> int:
+    """Максимум символов RAG-контекста при жёстком лимите num_ctx.
+
+    Все части промта (system-промт со словарём, история, вопрос) оцениваются
+    одной мерой (chars/2), поэтому «прогнозируемые токены» RAG-контекста
+    = budget_chars / 2 и суммарный промт не превысит num_ctx - reserve.
+    """
+    overhead = (
+        estimate_tokens(system_text)
+        + estimate_tokens(history_text)
+        + estimate_tokens(question_text)
+        + reserve
+    )
+    budget_tokens = max(0, num_ctx - overhead)
+    return budget_tokens * CHARS_PER_TOKEN
+
+
 def normalize_token(token: str) -> str:
     """Приводит токен к каноническому виду для сравнения со словарём.
 

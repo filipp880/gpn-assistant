@@ -12,14 +12,9 @@ PARENT_MAP_FILE = os.path.join(config.CHROMADB_DIR, "parent_map.json")
 
 
 def _read_document(path: str, name: str) -> str:
-    """Извлекает текст из txt или pdf документа."""
-    if name.lower().endswith(".pdf"):
-        from pypdf import PdfReader
-        reader = PdfReader(path)
-        pages = [page.extract_text() or "" for page in reader.pages]
-        return "\n".join(pages)
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
+    """Извлекает текст из документа: TXT, PDF, DOCX, XLSX или PPTX."""
+    from docs import read_document as _read_any
+    return _read_any(path, ext=os.path.splitext(name)[1])
 
 
 def main():

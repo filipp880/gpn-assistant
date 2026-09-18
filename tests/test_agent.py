@@ -51,6 +51,66 @@ def test_process_query_no_context_answer(monkeypatch, mocked_agent):
     assert result["raw_context"] == ""
 
 
+def test_search_pool_includes_original_query(monkeypatch):
+    """Исходный запрос всегда в пуле поиска — страховка от потери аспекта декомпозицией."""
+    inst = GpnAgent()
+    inst.self_check = False
+    captured = {}
+
+    def fake_decompose(self, user_query, trace=None):
+        return ["риски", "меры контроля"]
+
+    def fake_batch(pool, trace=None):
+        captured["pool"] = list(pool)
+        return [
+            {"query": q, "context": f"контекст про {q}", "sources": [f"{i}.txt"],
+             "resolved_terms": [], "results_count": 1}
+            for i, q in enumerate(pool)
+        ]
+
+    def fake_chat(messages, options=None, **kwargs):
+        return {"message": {"content": "ответ"}, "usage": {}}
+
+    monkeypatch.setattr(GpnAgent, "_decompose_query", fake_decompose)
+    monkeypatch.setattr(inst, "_search_batch", fake_batch)
+    monkeypatch.setattr(inst, "_chat", fake_chat)
+
+    query = "Какие риски у предприятия и меры контроля?"
+    inst.process_query(query, [])
+
+    # исходный запрос первым, подзапросы следом, дубликатов нет
+    assert captured["pool"][0] == query
+    assert set(captured["pool"]).issuperset({"риски", "меры контроля"})
+    assert len(captured["pool"]) == len(set(captured["pool"]))
+
+
+def test_synthesis_context_respects_token_budget(monkeypatch):
+    """Огромный контекст обрезается под бюджет num_ctx, а не улетает целиком."""
+    inst = GpnAgent()
+    inst.self_check = False
+    inst.num_ctx = 4096  # небольшое окно — контекст обязан обрезаться
+
+    big = "Длинный контекст про EBITDA." * 2000  # ~34 000 символов
+    assert len(big) > 1000
+
+    def fake_hybrid(query, top_k=None, use_reranker=True, trace=None):
+        return [(big, "doc.txt")]
+
+    def fake_chat(messages, options=None, **kwargs):
+        return {"message": {"content": "ответ"}, "usage": {}}
+
+    monkeypatch.setattr(agent, "hybrid_search", fake_hybrid)
+    monkeypatch.setattr(inst, "_chat", fake_chat)
+
+    result = inst.process_query("вопрос", [])
+
+    # контекст обрезан (не равен исходному гиганту), но непуст и несёт содержание
+    assert result["raw_context"]
+    assert len(result["raw_context"]) < len(big)
+    assert "Длинный контекст про EBITDA" in result["raw_context"]
+    assert result["sources"] == ["doc.txt"]
+
+
 def test_run_my_agent_logic_delegates(monkeypatch):
     calls = []
 

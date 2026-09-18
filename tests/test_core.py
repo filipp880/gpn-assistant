@@ -9,6 +9,10 @@ from core import (
     OkapiBM25,
     parent_child_chunk,
     estimate_top_k,
+    estimate_tokens,
+    context_budget_chars,
+    fit_context_budget,
+    CHARS_PER_TOKEN,
 )
 
 DICT = {
@@ -318,3 +322,67 @@ def test_estimate_top_k_multiple_entities_higher():
     one = estimate_top_k("Какая EBITDA у ГПНР")
     many = estimate_top_k("Покажи EBITDA, выручку и прибыль ГПНР, ЦДНГ и НГДУ за 2025")
     assert many >= one
+
+
+# --- бюджет токенов контекста для синтеза ---
+
+def test_estimate_tokens_bounds():
+    assert estimate_tokens("") == 0
+    assert estimate_tokens("x" * 7) == 4  # ceil(7 / 2)
+    assert estimate_tokens("привет мир") == 5  # ceil(10 / 2)
+
+
+def test_context_budget_respects_num_ctx():
+    # Суммарный «прогнозируемый размер промта» не должен выйти за num_ctx - reserve
+    num_ctx = 2048
+    budget = context_budget_chars(
+        num_ctx,
+        system_text="Раз" * 50,      # 150 символов
+        history_text="Диалог" * 20,  # 120 символов
+        question_text="Вопрос",
+    )
+    assert 0 <= budget <= num_ctx * CHARS_PER_TOKEN
+
+
+def test_context_budget_zero_when_overhead_exceeds():
+    budget = context_budget_chars(
+        128,
+        system_text="x" * 100_000,  # один словарь уже больше всего окна
+        history_text="",
+        question_text="",
+    )
+    assert budget == 0
+
+
+def test_fit_context_budget_fits_all():
+    parts = ["aaa", "bbbb", "ccccc"]
+    fitted, used, trimmed = fit_context_budget(parts, 100)
+    assert fitted == parts
+    assert used == len("aaabbbbccccc")
+    assert trimmed is False
+
+
+def test_fit_context_budget_drops_excess_after_cut_point():
+    parts = ["a" * 50, "b" * 50, "c" * 50]
+    fitted, used, trimmed = fit_context_budget(parts, 110)
+    assert trimmed is True
+    assert used <= 110
+    # первые два фрагмента целиком, третий обрезан под остаток бюджета
+    assert fitted == ["a" * 50, "b" * 50, "c" * 10]
+
+
+def test_fit_context_budget_truncates_last_sentence():
+    part = "Первое предложение о рисках. Второе предложение о мерах контроля. Третье."
+    fitted, used, trimmed = fit_context_budget([part, "четвёртый"], 40)
+    assert trimmed is True
+    assert len(fitted) == 1
+    assert used <= 40
+    # обрезка идёт по границе предложения, не по середине слова
+    assert fitted[0].endswith("рисках.") or fitted[0].endswith("рисках. ")
+
+
+def test_fit_context_budget_empty_parts():
+    fitted, used, trimmed = fit_context_budget([], 500)
+    assert fitted == []
+    assert used == 0
+    assert trimmed is False
